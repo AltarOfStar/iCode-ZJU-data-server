@@ -28,6 +28,7 @@ MAGIC = b"IGWS"
 VERSION = 1
 HEADER_BYTES = 12
 WORKSPACE_IGNORED_MAX = 200
+WORKSPACE_IGNORED_PATH_MAX = 512
 
 _IGNORED_KEY = "ignored"
 
@@ -150,7 +151,11 @@ def summary_counts(manifest: Mapping[str, Any]) -> dict[str, int]:
 
 
 def ignored_summary(manifest: Mapping[str, Any]) -> tuple[int, bool, tuple[str, ...]]:
-    """忽略清单只保留路径（目录折叠、≤200 条、超出 `truncated`），正文永不入库。"""
+    """忽略清单只保留路径（目录折叠、≤200 条、超出 `truncated`），正文永不入库。
+
+    单条路径超 512 字符按 manifest 结构性错误拒绝（agent-config-sync §2-4）：
+    客户端应先行折叠，teams 端把超长路径计入 `count` 并置 `truncated`。
+    """
     block = manifest.get(_IGNORED_KEY)
     if not isinstance(block, Mapping):
         return 0, False, ()
@@ -164,6 +169,12 @@ def ignored_summary(manifest: Mapping[str, Any]) -> tuple[int, bool, tuple[str, 
                 path = entry.get("path")
                 if isinstance(path, str):
                     paths.append(path)
+    for path in paths:
+        if len(path) > WORKSPACE_IGNORED_PATH_MAX:
+            raise WorkspaceManifestError(
+                f"ignored entry path is {len(path)} characters, limit is"
+                f" {WORKSPACE_IGNORED_PATH_MAX}"
+            )
     truncated = bool(block.get("truncated", False)) or (
         isinstance(entries, list) and len(entries) > WORKSPACE_IGNORED_MAX
     )

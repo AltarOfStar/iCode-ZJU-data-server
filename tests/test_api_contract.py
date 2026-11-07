@@ -86,6 +86,42 @@ async def test_rate_limited_batch_returns_429(custom_client) -> None:
     assert second.headers["retry-after"]
 
 
+async def test_per_user_rate_limit_does_not_block_other_users(custom_client) -> None:
+    """单用户桶防单点刷量，但同一租户的其他用户不受影响（§6.4-2）。"""
+    client = await custom_client(
+        tokens={
+            "token-a": Principal(tenant="acme", user_id="user-a"),
+            "token-b": Principal(tenant="acme", user_id="user-b"),
+        },
+        rate_limit_per_second=100.0,
+        rate_limit_burst=100.0,
+        rate_limit_per_user_per_second=0.0001,
+        rate_limit_per_user_burst=1.0,
+    )
+    frame = unit("repo.identity", "repo:repo-identity-1", repository_payload())
+    assert (await client.post_batch(frame, token="token-a")).status_code == 200
+    assert (await client.post_batch(frame, token="token-a")).status_code == 429
+    assert (await client.post_batch(frame, token="token-b")).status_code == 200
+
+
+async def test_overloaded_request_is_503_before_reading_the_body(custom_client) -> None:
+    """请求闸门满时立即 503，不读体、不产生副作用（§6.4-1）。"""
+    client = await custom_client(max_concurrent_requests=1)
+    gate = client.services.gate
+    assert gate.try_enter()
+    try:
+        frame = unit("repo.identity", "repo:repo-identity-1", repository_payload())
+        response = await client.post_batch(frame)
+        assert response.status_code == 503
+        assert response.json()["error"] == "overloaded"
+        assert response.headers["retry-after"]
+        assert client.repository.receipts == {}
+    finally:
+        gate.leave()
+    frame = unit("repo.identity", "repo:repo-identity-1", repository_payload())
+    assert (await client.post_batch(frame)).status_code == 200
+
+
 async def test_backpressure_defers_whole_batch(custom_client) -> None:
     client = await custom_client(max_inflight_batches_per_tenant=1)
     guard = client.services.processor.guard

@@ -53,11 +53,14 @@ create table if not exists sessions (
    snapshot_etag text,
    body_state text,
    body_checked_at timestamptz,
-   -- v10：环境复现
+   -- v10：环境复现三列（agent-config-sync §1：唯一写入者是 agent.env）
    agent_config_sha256 text,
    workspace_kind text,
+   agent_config_captured_at timestamptz,
    primary key (tenant, external_session_id)
 );
+-- 既有库补列（幂等；schema 版本随下一次变更统一 +1）
+alter table sessions add column if not exists agent_config_captured_at timestamptz;
 create index if not exists sessions_repository_identities on sessions using gin (repository_identities);
 create index if not exists sessions_snapshot_sha on sessions (tenant, snapshot_sha256);
 create index if not exists sessions_agent_config_sha on sessions (tenant, agent_config_sha256);
@@ -141,10 +144,25 @@ create table if not exists object_registry (
    verified_at timestamptz,
    -- 本服务扩列：缺块终态的缺口清单（§3.2-5）
    missing_hashes text[] not null default '{}',
-   primary key (tenant, sha256)
+   primary key (tenant, sha256),
+   -- 取值域与 models.OBJECT_* 一致（schema 层静态可校验）
+   constraint object_registry_state_check
+      check (state in ('verified', 'pending', 'missing', 'superseded'))
 );
 create index if not exists object_registry_state_expiry
    on object_registry (tenant, state, ticket_expires_at);
+-- 既有库补约束（幂等；create table if not exists 不会给老表加约束）
+do $$
+begin
+   if not exists (
+      select 1 from pg_constraint
+      where conname = 'object_registry_state_check'
+        and conrelid = 'object_registry'::regclass
+   ) then
+      alter table object_registry add constraint object_registry_state_check
+         check (state in ('verified', 'pending', 'missing', 'superseded'));
+   end if;
+end $$;
 
 create table if not exists ingest_receipts (
    tenant text not null,
@@ -156,9 +174,23 @@ create table if not exists ingest_receipts (
    -- 本服务扩列：终态拒绝的拒绝码与说明
    code text,
    message text,
-   primary key (tenant, channel, idempotency_key)
+   primary key (tenant, channel, idempotency_key),
+   -- 取值域与 models.RECEIPT_* 一致（schema 层静态可校验）
+   constraint ingest_receipts_state_check
+      check (state in ('pending', 'committed', 'rejected', 'unsupported'))
 );
 create index if not exists ingest_receipts_state on ingest_receipts (tenant, state);
+do $$
+begin
+   if not exists (
+      select 1 from pg_constraint
+      where conname = 'ingest_receipts_state_check'
+        and conrelid = 'ingest_receipts'::regclass
+   ) then
+      alter table ingest_receipts add constraint ingest_receipts_state_check
+         check (state in ('pending', 'committed', 'rejected', 'unsupported'));
+   end if;
+end $$;
 
 create table if not exists workspace_states (
    tenant text not null,
@@ -207,15 +239,18 @@ create table if not exists repository_registry (
 );
 create index if not exists repository_registry_key on repository_registry (tenant, repository_key);
 
--- 服务端本地簿记：agent-config 锚点（`agent.env` 先于 `session.meta` 到达时使用）
+-- 服务端本地簿记：agent-config 锚点（`agent.env` 先于 `session.meta` 到达时使用）。
+-- 环境三列的镜像：等 `sessions` 行建立时 coalesce（agent-config-sync §1）。
 create table if not exists session_anchors (
    tenant text not null,
    session_id text not null,
    agent_config_sha256 text,
    workspace_kind text,
+   agent_config_captured_at timestamptz,
    updated_at timestamptz not null default now(),
    primary key (tenant, session_id)
 );
+alter table session_anchors add column if not exists agent_config_captured_at timestamptz;
 
 insert into schema_meta (component, schema_version, applied_by)
 values ('icode-data-server', 10, 'bootstrap')

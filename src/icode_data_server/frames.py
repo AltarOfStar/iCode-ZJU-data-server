@@ -47,6 +47,10 @@ class FrameHeader:
     payload_len: int
     created_at: str | None = None
     reset: bool = False
+    # agent.env 信封扩展（agent-config-sync §1）：workspaceKind 三值枚举 + capturedAt（RFC3339）。
+    # 不参与 unit_id 派生；其它 kind 忽略。
+    workspace_kind: str | None = None
+    captured_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +72,10 @@ def _require_str(raw: dict[str, Any], key: str, *, required: bool = True) -> str
     if not isinstance(value, str):
         raise FrameError(f"frame header {key!r} must be a string")
     return value
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def header_from_json(raw: Any) -> FrameHeader:
@@ -92,6 +100,8 @@ def header_from_json(raw: Any) -> FrameHeader:
         payload_len=payload_len,
         created_at=raw.get("created_at") if isinstance(raw.get("created_at"), str) else None,
         reset=reset,
+        workspace_kind=_optional_str(raw.get("workspaceKind")),
+        captured_at=_optional_str(raw.get("capturedAt")),
     )
 
 

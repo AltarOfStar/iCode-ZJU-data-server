@@ -24,9 +24,16 @@ def test_defaults_are_zero_dependency(monkeypatch) -> None:
     assert settings.object_store_backend == "local"
     assert settings.port == 8080
     assert settings.max_body_bytes == 16 * 1024 * 1024
-    assert settings.max_expanded_bytes == 64 * 1024 * 1024
+    assert settings.max_expanded_bytes == 16 * 1024 * 1024
     assert settings.max_frame_payload_bytes == 1024 * 1024
     assert settings.max_frames_per_batch == 4096
+    assert settings.batch_timeout_s == 8.0
+    assert settings.max_concurrent_requests == 64
+    assert settings.rate_limit_per_second == 50.0
+    assert settings.rate_limit_per_user_per_second == 5.0
+    assert settings.max_inflight_batches_per_tenant == 64
+    assert settings.staging_bytes_per_tenant == 4 * 1024 * 1024 * 1024
+    assert settings.postgres_pool_max_size == 20
     assert settings.max_window_index_lines == 200
     assert settings.max_window_bytes == 4 * 1024 * 1024
     assert settings.assembly_ttl_s == 24 * 3600
@@ -42,11 +49,19 @@ def test_env_overrides(monkeypatch) -> None:
     monkeypatch.setenv("ICODE_DS_S3_BUCKET", "bucket")
     monkeypatch.setenv("ICODE_DS_TOKENS", '{"t1": {"tenant": "acme", "user_id": "u1"}}')
     monkeypatch.setenv("ICODE_DS_PORT", "9000")
+    monkeypatch.setenv("ICODE_DS_MAX_CONCURRENT_REQUESTS", "16")
+    monkeypatch.setenv("ICODE_DS_RATE_LIMIT_PER_USER_PER_SECOND", "2.5")
+    monkeypatch.setenv("ICODE_DS_POSTGRES_POOL_MAX_SIZE", "40")
+    monkeypatch.setenv("ICODE_DS_POSTGRES_POOL_TIMEOUT_S", "2.5")
     settings = Settings.from_env()
     assert settings.repository_backend == "postgres"
     assert settings.object_store_backend == "s3"
     assert settings.s3_bucket == "bucket"
     assert settings.port == 9000
+    assert settings.max_concurrent_requests == 16
+    assert settings.rate_limit_per_user_per_second == 2.5
+    assert settings.postgres_pool_max_size == 40
+    assert settings.postgres_pool_timeout_s == 2.5
     principal = settings.principal_for_token("t1")
     assert principal is not None
     assert (principal.tenant, principal.user_id) == ("acme", "u1")

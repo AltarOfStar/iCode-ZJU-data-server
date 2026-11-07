@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import json
 import struct
 
 import pytest
 
 from icode_data_server.frames import FrameError, decode_frames, encode_frame, unit_id_for
+
+from .helpers import agent_env_payload
 
 
 def _sha(data: bytes) -> str:
@@ -52,9 +53,15 @@ def test_bad_header_json_is_a_format_error() -> None:
 
 
 async def test_gzip_body_is_expanded(client) -> None:
-    payload = json.dumps({"redacted": []}).encode()
+    payload = agent_env_payload()
     raw = encode_frame(
-        {"kind": "agent.env", "session_id": "s1", "scope": "agentenv:" + _sha(payload)},
+        {
+            "kind": "agent.env",
+            "session_id": "s1",
+            "scope": "agentenv:" + _sha(payload),
+            "workspaceKind": "git",
+            "capturedAt": "2026-11-06T09:59:58Z",
+        },
         payload,
     )
     response = await client.post_batch(gzip.compress(raw), headers={"Content-Encoding": "gzip"})

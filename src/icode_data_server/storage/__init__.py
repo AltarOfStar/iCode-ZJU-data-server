@@ -53,7 +53,11 @@ def build_repository(settings: Settings) -> Repository:
         if not settings.postgres_dsn:
             raise ValueError("REPOSITORY_BACKEND=postgres requires ICODE_DS_POSTGRES_DSN")
         return PostgresRepository(
-            settings.postgres_dsn, auto_migrate=settings.postgres_auto_migrate
+            settings.postgres_dsn,
+            auto_migrate=settings.postgres_auto_migrate,
+            min_size=settings.postgres_pool_min_size,
+            max_size=settings.postgres_pool_max_size,
+            pool_timeout_s=settings.postgres_pool_timeout_s,
         )
     raise ValueError(f"unknown REPOSITORY_BACKEND: {backend}")
 

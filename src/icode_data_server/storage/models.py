@@ -70,8 +70,10 @@ class SessionRecord:
     snapshot_size: int | None = None
     snapshot_state: str = "ok"
     body_state: str | None = None
+    # v10 环境复现三列：唯一写入者是 agent.env（agent-config-sync §1）
     agent_config_sha256: str | None = None
     workspace_kind: str | None = None
+    agent_config_captured_at: datetime | None = None
     linked: str = "unlinked"
 
     def with_updates(self, **changes: object) -> SessionRecord:
@@ -195,4 +197,5 @@ class SessionAnchor:
     session_id: str
     agent_config_sha256: str | None = None
     workspace_kind: str | None = None
+    agent_config_captured_at: datetime | None = None
     updated_at: datetime | None = None

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
+import time
 
 from icode_data_server.ingest.workspace import (
     build_container,
@@ -152,3 +154,136 @@ async def test_same_file_content_is_deduplicated_across_paths(client) -> None:
         )
     ).json()
     assert response["accepted"], response
+
+
+async def test_staging_ttl_marks_missing_releases_bytes_and_heals_on_replay(
+    custom_client,
+) -> None:
+    """P0-2 回归：TTL 释放字节后，重放已 committed 的分片必须重新物化并治愈。"""
+    client = await custom_client(assembly_ttl_s=0.0)
+    payload, contents = _manifest(files=[("big.bin", b"a" * 10)])
+    frames = workspace_file_frames(contents, chunk_size=4)
+    assert len(frames) == 3
+    digest, body = contents[0]
+    staging_dir = client.staging / "dev" / "wsfile" / digest
+
+    response = (await client.post_batch(batch(frames[0], frames[1]))).json()
+    assert len(response["accepted"]) == 2
+    assert staging_dir.exists()
+    # 下一批先触发清扫（ttl=0）：缺块终态 + 分片字节释放，manifest 随之 deferred
+    response = (
+        await client.post_batch(
+            unit("workspace.manifest", f"ws:{sha(payload)}", payload, session_id=SESSION)
+        )
+    ).json()
+    assert response["deferred"], response
+    record = await client.repository.get_object("dev", digest)
+    assert record is not None and record.state == "missing"
+    assert record.missing_hashes
+    assert not staging_dir.exists()
+
+    # 客户端按协商重发：已 committed 的两个分片走 duplicates 重新落盘，
+    # 第三个（此前从未送达）作为新单元接受，落最后一块即完成拼装
+    response = (await client.post_batch(batch(*frames))).json()
+    assert len(response["duplicates"]) == 2, response
+    assert len(response["accepted"]) == 1, response
+    assert await client.object_store.get("dev", digest) == body
+
+    response = (
+        await client.post_batch(
+            unit("workspace.manifest", f"ws:{sha(payload)}", payload, session_id=SESSION)
+        )
+    ).json()
+    assert response["accepted"], response
+    rows = await client.repository.list_workspace_states("dev", SESSION)
+    assert len(rows) == 1
+
+
+async def test_staging_budget_overrun_defers_instead_of_evicting(custom_client) -> None:
+    """P0-2 回归：超预算是背压（deferred），不是静默淘汰。"""
+    client = await custom_client(staging_bytes_per_session=8)
+    payload, contents = _manifest(files=[("big.bin", b"a" * 10)])
+    frames = workspace_file_frames(contents, chunk_size=4)
+    digest = contents[0][0]
+
+    response = (await client.post_batch(batch(frames[0], frames[1]))).json()
+    assert len(response["accepted"]) == 2
+
+    # 第三个分片会超出会话预算 → deferred（无副作用），已收分片原样保留
+    response = (await client.post_batch(frames[2])).json()
+    assert len(response["deferred"]) == 1, response
+    assert response["retry_after_ms"] > 0
+    assert not await client.object_store.exists("dev", digest)
+    record = await client.repository.get_object("dev", digest)
+    assert record is None  # 没有被标 missing，也没有部分提交
+    staged = sorted(path.name for path in (client.staging / "dev" / "wsfile" / digest).iterdir())
+    assert staged == ["000000.bin", "000001.bin"]
+
+
+async def test_orphaned_staging_directories_are_reclaimed(client) -> None:
+    """重启后无人认领的暂存目录由清扫按 mtime 回收，活跃目录不受影响。"""
+    orphan = client.staging / "dev" / "wsfile" / ("f" * 64)
+    orphan.mkdir(parents=True)
+    stale = orphan / "000000.bin"
+    stale.write_bytes(b"x")
+    old = time.time() - 48 * 3600
+    os.utime(stale, (old, old))
+
+    fresh = client.staging / "dev" / "wsfile" / ("e" * 64)
+    fresh.mkdir(parents=True)
+    (fresh / "000000.bin").write_bytes(b"y")
+
+    await client.post_batch(unit("repo.identity", "repo:repo-identity-1", b"{}"))
+    assert not orphan.exists()
+    assert fresh.exists()
+
+
+async def test_ignored_entries_are_frozen_on_first_capture(client) -> None:
+    """忽略清单首采冻结（agent-config-sync §2-4）：重采不改写三列。"""
+    first_payload, first_contents = _manifest(ignored=["node_modules/", "dist/"])
+    await client.post_batch(batch(*workspace_file_frames(first_contents)))
+    response = (
+        await client.post_batch(
+            unit(
+                "workspace.manifest",
+                f"ws:{sha(first_payload)}",
+                first_payload,
+                session_id=SESSION,
+            )
+        )
+    ).json()
+    assert response["accepted"], response
+
+    # 重采：清单变了（新增 .venv/），镜像推进，但忽略清单保持首采口径
+    second_payload, second_contents = _manifest(ignored=["node_modules/", "dist/", ".venv/"])
+    await client.post_batch(batch(*workspace_file_frames(second_contents)))
+    response = (
+        await client.post_batch(
+            unit(
+                "workspace.manifest",
+                f"ws:{sha(second_payload)}",
+                second_payload,
+                session_id=SESSION,
+            )
+        )
+    ).json()
+    assert response["accepted"], response
+
+    rows = await client.repository.list_workspace_states("dev", SESSION)
+    assert len(rows) == 1
+    assert rows[0].ignored_count == 2
+    assert rows[0].ignored_entries == ("node_modules/", "dist/")
+
+
+async def test_ignored_entry_path_over_512_is_rejected(client) -> None:
+    """单条忽略路径 ≤ 512 字符：超限按 manifest 结构性错误拒绝（客户端应先行折叠）。"""
+    payload, contents = _manifest(ignored=["x" * 513])
+    await client.post_batch(batch(*workspace_file_frames(contents)))
+    response = (
+        await client.post_batch(
+            unit("workspace.manifest", f"ws:{sha(payload)}", payload, session_id=SESSION)
+        )
+    ).json()
+    assert response["rejected"][0]["code"] == "schema_invalid"
+    assert "512" in response["rejected"][0]["message"]
+    assert await client.repository.list_workspace_states("dev", SESSION) == []

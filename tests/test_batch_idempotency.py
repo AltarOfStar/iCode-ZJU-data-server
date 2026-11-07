@@ -8,7 +8,7 @@ import struct
 from icode_data_server.frames import encode_frame
 
 from .helpers import (
-    SESSION,
+    agent_env_frame,
     agent_env_payload,
     batch,
     repository_payload,
@@ -92,7 +92,7 @@ async def test_unsupported_frame_version_is_rejected(client) -> None:
 
 async def test_agent_env_resend_is_a_duplicate(client) -> None:
     payload = agent_env_payload()
-    body = unit("agent.env", f"agentenv:{sha(payload)}", payload, session_id=SESSION)
+    body = agent_env_frame(payload)
     first = (await client.post_batch(body)).json()
     second = (await client.post_batch(body)).json()
     assert len(first["accepted"]) == 1

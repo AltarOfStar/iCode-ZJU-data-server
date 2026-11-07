@@ -10,7 +10,7 @@ import json
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
@@ -21,6 +21,7 @@ from .models import (
     ObjectRecord,
     ReceiptRecord,
     RepositoryRecord,
+    SessionAnchor,
     SessionRecord,
     TurnRecord,
     WorkspaceStateRecord,
@@ -35,17 +36,27 @@ _CONNECTION: ContextVar[asyncpg.Connection | None] = ContextVar(
 
 class PostgresRepository:
     def __init__(
-        self, dsn: str, *, auto_migrate: bool = True, min_size: int = 1, max_size: int = 10
+        self,
+        dsn: str,
+        *,
+        auto_migrate: bool = True,
+        min_size: int = 2,
+        max_size: int = 20,
+        pool_timeout_s: float = 5.0,
     ):
         self._dsn = dsn
         self._auto_migrate = auto_migrate
         self._min_size = min_size
         self._max_size = max_size
+        self._pool_timeout_s = pool_timeout_s
         self._pool: asyncpg.Pool | None = None
 
     async def start(self) -> None:
         self._pool = await asyncpg.create_pool(
-            self._dsn, min_size=self._min_size, max_size=self._max_size
+            self._dsn,
+            min_size=self._min_size,
+            max_size=self._max_size,
+            timeout=self._pool_timeout_s,
         )
         if self._auto_migrate:
             await self.migrate()
@@ -126,6 +137,7 @@ class PostgresRepository:
             "   state = case when object_registry.state = 'verified' then 'verified'"
             " else excluded.state end,"
             "   size_bytes = excluded.size_bytes,"
+            "   etag = excluded.etag,"
             "   missing_hashes = excluded.missing_hashes,"
             "   verified_at = coalesce(object_registry.verified_at, excluded.verified_at)",
             record.tenant,
@@ -157,6 +169,15 @@ class PostgresRepository:
         )
         return {row["sha256"] for row in rows}
 
+    async def mark_object_superseded(self, tenant: str, sha256: str) -> None:
+        """覆写汰换（agent-config-sync §1）：旧引用对象置 superseded，OBS 字节保留。"""
+        await self._execute(
+            "update object_registry set state = 'superseded'"
+            " where tenant = $1 and sha256 = $2 and state <> 'superseded'",
+            tenant,
+            sha256,
+        )
+
     # 会话
 
     _SESSION_COLUMNS = (
@@ -164,7 +185,7 @@ class PostgresRepository:
         " title, agent_profile, model_provider, model_id, producer_version,"
         " parent_external_session_id, primary_cwd_digest, turn_count, message_count, total_tokens,"
         " repository_identities, snapshot_sha256, snapshot_size, snapshot_state, body_state,"
-        " agent_config_sha256, workspace_kind"
+        " agent_config_sha256, workspace_kind, agent_config_captured_at"
     )
 
     async def get_session(self, tenant: str, session_id: str) -> SessionRecord | None:
@@ -194,11 +215,19 @@ class PostgresRepository:
                 record.updated_at, record.observed_at, previous_updated, previous_observed
             ):
                 return False
+        # 环境三列只由 agent.env 写（agent-config-sync §1）：session.meta 侧传 NULL，
+        # 首插从 session_anchors coalesce，更新分支不写也不清除。
         await self._execute(
             "insert into sessions ("
             + self._SESSION_COLUMNS
             + ") values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,"
-            "$20,$21,$22,$23,$24)"
+            "$20,$21,$22,"
+            " coalesce($23, (select agent_config_sha256 from session_anchors"
+            "   where tenant = $1 and session_id = $2)),"
+            " coalesce($24, (select workspace_kind from session_anchors"
+            "   where tenant = $1 and session_id = $2)),"
+            " coalesce($25, (select agent_config_captured_at from session_anchors"
+            "   where tenant = $1 and session_id = $2)))"
             " on conflict (tenant, external_session_id) do update set"
             "   user_id = excluded.user_id,"
             "   content_hash = excluded.content_hash,"
@@ -216,15 +245,17 @@ class PostgresRepository:
             "   message_count = excluded.message_count,"
             "   total_tokens = excluded.total_tokens,"
             "   repository_identities = ("
-            "     select array(select distinct unnest("
-            "       sessions.repository_identities || excluded.repository_identities))[1:16]"
+            "     (select array(select distinct unnest("
+            "       sessions.repository_identities || excluded.repository_identities)))[1:16]"
             "   ),"
             "   snapshot_sha256 = excluded.snapshot_sha256,"
             "   snapshot_size = excluded.snapshot_size,"
             "   snapshot_state = excluded.snapshot_state,"
             "   agent_config_sha256 = coalesce(excluded.agent_config_sha256,"
             " sessions.agent_config_sha256),"
-            "   workspace_kind = coalesce(excluded.workspace_kind, sessions.workspace_kind)",
+            "   workspace_kind = coalesce(excluded.workspace_kind, sessions.workspace_kind),"
+            "   agent_config_captured_at = coalesce(excluded.agent_config_captured_at,"
+            " sessions.agent_config_captured_at)",
             record.tenant,
             record.session_id,
             record.user_id,
@@ -249,25 +280,46 @@ class PostgresRepository:
             record.body_state,
             record.agent_config_sha256,
             record.workspace_kind,
+            record.agent_config_captured_at,
         )
         return True
 
-    async def set_agent_config_anchor(self, tenant: str, session_id: str, sha256: str) -> None:
+    async def set_agent_config_anchor(
+        self,
+        tenant: str,
+        session_id: str,
+        sha256: str,
+        *,
+        workspace_kind: str | None = None,
+        captured_at: datetime | None = None,
+    ) -> None:
         await self._execute(
-            "insert into session_anchors (tenant, session_id, agent_config_sha256)"
-            " values ($1, $2, $3)"
+            "insert into session_anchors"
+            " (tenant, session_id, agent_config_sha256, workspace_kind, agent_config_captured_at)"
+            " values ($1, $2, $3, $4, $5)"
             " on conflict (tenant, session_id) do update set"
-            "   agent_config_sha256 = excluded.agent_config_sha256, updated_at = now()",
+            "   agent_config_sha256 = excluded.agent_config_sha256,"
+            "   workspace_kind = coalesce(excluded.workspace_kind, session_anchors.workspace_kind),"
+            "   agent_config_captured_at = coalesce(excluded.agent_config_captured_at,"
+            "     session_anchors.agent_config_captured_at),"
+            "   updated_at = now()",
             tenant,
             session_id,
             sha256,
+            workspace_kind,
+            captured_at,
         )
         await self._execute(
-            "update sessions set agent_config_sha256 = $3"
+            "update sessions set"
+            " agent_config_sha256 = $3,"
+            " workspace_kind = coalesce($4, sessions.workspace_kind),"
+            " agent_config_captured_at = coalesce($5, sessions.agent_config_captured_at)"
             " where tenant = $1 and external_session_id = $2",
             tenant,
             session_id,
             sha256,
+            workspace_kind,
+            captured_at,
         )
 
     async def get_agent_config_anchor(self, tenant: str, session_id: str) -> str | None:
@@ -285,6 +337,33 @@ class PostgresRepository:
             session_id,
         )
         return None if row is None else row["agent_config_sha256"]
+
+    async def get_agent_config_anchor_state(
+        self, tenant: str, session_id: str
+    ) -> SessionAnchor | None:
+        """三列现状：会话行优先（`session.meta` 落地后以行为准），否则用锚点。"""
+        row = await self._fetchrow(
+            "select agent_config_sha256, workspace_kind, agent_config_captured_at"
+            " from sessions where tenant = $1 and external_session_id = $2",
+            tenant,
+            session_id,
+        )
+        if row is None or not row["agent_config_sha256"]:
+            row = await self._fetchrow(
+                "select agent_config_sha256, workspace_kind, agent_config_captured_at"
+                " from session_anchors where tenant = $1 and session_id = $2",
+                tenant,
+                session_id,
+            )
+        if row is None or not row["agent_config_sha256"]:
+            return None
+        return SessionAnchor(
+            tenant=tenant,
+            session_id=session_id,
+            agent_config_sha256=row["agent_config_sha256"],
+            workspace_kind=row["workspace_kind"],
+            agent_config_captured_at=row["agent_config_captured_at"],
+        )
 
     async def set_session_body_state(self, tenant: str, session_id: str, state: str) -> None:
         await self._execute(
@@ -437,10 +516,7 @@ class PostgresRepository:
             "   untracked_entries = excluded.untracked_entries,"
             "   omitted_count = excluded.omitted_count,"
             "   complete = excluded.complete,"
-            "   capture_duration_ms = excluded.capture_duration_ms,"
-            "   ignored_count = excluded.ignored_count,"
-            "   ignored_truncated = excluded.ignored_truncated,"
-            "   ignored_entries = excluded.ignored_entries"
+            "   capture_duration_ms = excluded.capture_duration_ms"
             " where workspace_states.captured_at is null"
             "    or excluded.captured_at >= workspace_states.captured_at",
             record.tenant,
@@ -637,6 +713,7 @@ def _session_from_row(row) -> SessionRecord:
         body_state=data["body_state"],
         agent_config_sha256=data["agent_config_sha256"],
         workspace_kind=data["workspace_kind"],
+        agent_config_captured_at=data["agent_config_captured_at"],
     )
 
 
@@ -646,7 +723,7 @@ def _is_newer(
     previous_updated: datetime | None,
     previous_observed: datetime | None,
 ) -> bool:
-    epoch = datetime.min
+    epoch = datetime.min.replace(tzinfo=UTC)
     left = (updated_at or epoch, observed_at or epoch)
     right = (previous_updated or epoch, previous_observed or epoch)
     return left > right

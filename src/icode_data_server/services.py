@@ -7,8 +7,10 @@ import logging
 
 from .config import Settings
 from .ingest.assembly import AssemblyStore
+from .ingest.backpressure import RequestGate
 from .ingest.manifest import ManifestService
 from .ingest.processor import BatchProcessor
+from .ingest.snapshots import SnapshotAssembler
 from .ingest.trajectory import TrajectoryStore
 from .storage import build_object_store, build_repository
 
@@ -28,6 +30,8 @@ class Services:
             per_tenant_bytes=settings.staging_bytes_per_tenant,
             ttl_s=settings.assembly_ttl_s,
         )
+        # 请求级并发闸门（§6.4-1）：两个端点共用，在读体之前拒绝。
+        self.gate = RequestGate(max_concurrent=settings.max_concurrent_requests)
         self.trajectory: TrajectoryStore | None = None
         self.processor: BatchProcessor | None = None
         self.manifest: ManifestService | None = None
@@ -48,14 +52,16 @@ class Services:
                 max_index_lines=self.settings.max_window_index_lines,
                 max_window_bytes=self.settings.max_window_bytes,
             )
+            self.assembler = SnapshotAssembler(self.repository, self.objects)
             self.processor = BatchProcessor(
                 settings=self.settings,
                 repository=self.repository,
                 objects=self.objects,
                 assemblies=self.assemblies,
                 trajectory=self.trajectory,
+                assembler=self.assembler,
             )
-            self.manifest = ManifestService(self.repository, self.assemblies, self.trajectory)
+            self.manifest = ManifestService(self.repository, self.assembler, self.trajectory)
             self._started = True
             logger.info(
                 "services_started",

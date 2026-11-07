@@ -82,6 +82,9 @@ class Settings:
     object_store_backend: str = "local"  # local | s3
     postgres_dsn: str = ""
     postgres_auto_migrate: bool = True
+    postgres_pool_min_size: int = 2
+    postgres_pool_max_size: int = 20
+    postgres_pool_timeout_s: float = 5.0
     local_object_root: Path = Path("data/objects")
 
     s3_bucket: str = ""
@@ -93,22 +96,27 @@ class Settings:
 
     # 限额（server-acceptance §2.1）
     max_body_bytes: int = 16 * MIB
-    max_expanded_bytes: int = 64 * MIB
+    max_expanded_bytes: int = 16 * MIB
     max_frame_payload_bytes: int = 1 * MIB
     max_frames_per_batch: int = 4096
-    batch_timeout_s: float = 30.0
+    batch_timeout_s: float = 8.0
+    # 单份快照的拼装上限：manifest 声明的 size 超过它直接拒绝（防拼装期内存放大）
+    max_snapshot_bytes: int = 64 * MIB
 
-    # 背压（§6.4）
-    rate_limit_per_second: float = 25.0
-    rate_limit_burst: float = 50.0
-    max_inflight_batches_per_tenant: int = 32
-    retry_after_ms: int = 1000
-    rate_limit_retry_after_s: int = 1
+    # 背压（§6.4）：请求闸门 → 两级令牌桶 → 在途批次
+    max_concurrent_requests: int = 64
+    rate_limit_per_second: float = 50.0
+    rate_limit_burst: float = 100.0
+    rate_limit_per_user_per_second: float = 5.0
+    rate_limit_per_user_burst: float = 10.0
+    max_inflight_batches_per_tenant: int = 64
+    retry_after_ms: int = 2000
+    rate_limit_retry_after_s: int = 3
 
     # 组装暂存（§3.2-4）
     staging_root: Path = Path("data/staging")
     staging_bytes_per_session: int = 64 * MIB
-    staging_bytes_per_tenant: int = 2 * GIB
+    staging_bytes_per_tenant: int = 4 * GIB
     assembly_ttl_s: float = 24 * 3600.0
     assembly_sweep_interval_s: float = 60.0
 
@@ -131,6 +139,15 @@ class Settings:
             object_store_backend=_str("OBJECT_STORE_BACKEND", d.object_store_backend).lower(),
             postgres_dsn=_str("ICODE_DS_POSTGRES_DSN", d.postgres_dsn),
             postgres_auto_migrate=_bool("ICODE_DS_POSTGRES_AUTO_MIGRATE", d.postgres_auto_migrate),
+            postgres_pool_min_size=_int(
+                "ICODE_DS_POSTGRES_POOL_MIN_SIZE", d.postgres_pool_min_size
+            ),
+            postgres_pool_max_size=_int(
+                "ICODE_DS_POSTGRES_POOL_MAX_SIZE", d.postgres_pool_max_size
+            ),
+            postgres_pool_timeout_s=_float(
+                "ICODE_DS_POSTGRES_POOL_TIMEOUT_S", d.postgres_pool_timeout_s
+            ),
             local_object_root=Path(_str("ICODE_DS_OBJECT_ROOT", str(d.local_object_root))),
             s3_bucket=_str("ICODE_DS_S3_BUCKET", d.s3_bucket),
             s3_endpoint_url=_str("ICODE_DS_S3_ENDPOINT_URL", d.s3_endpoint_url),
@@ -145,8 +162,18 @@ class Settings:
             ),
             max_frames_per_batch=_int("ICODE_DS_MAX_FRAMES_PER_BATCH", d.max_frames_per_batch),
             batch_timeout_s=_float("ICODE_DS_BATCH_TIMEOUT_S", d.batch_timeout_s),
+            max_snapshot_bytes=_int("ICODE_DS_MAX_SNAPSHOT_BYTES", d.max_snapshot_bytes),
+            max_concurrent_requests=_int(
+                "ICODE_DS_MAX_CONCURRENT_REQUESTS", d.max_concurrent_requests
+            ),
             rate_limit_per_second=_float("ICODE_DS_RATE_LIMIT_PER_SECOND", d.rate_limit_per_second),
             rate_limit_burst=_float("ICODE_DS_RATE_LIMIT_BURST", d.rate_limit_burst),
+            rate_limit_per_user_per_second=_float(
+                "ICODE_DS_RATE_LIMIT_PER_USER_PER_SECOND", d.rate_limit_per_user_per_second
+            ),
+            rate_limit_per_user_burst=_float(
+                "ICODE_DS_RATE_LIMIT_PER_USER_BURST", d.rate_limit_per_user_burst
+            ),
             max_inflight_batches_per_tenant=_int(
                 "ICODE_DS_MAX_INFLIGHT_BATCHES", d.max_inflight_batches_per_tenant
             ),

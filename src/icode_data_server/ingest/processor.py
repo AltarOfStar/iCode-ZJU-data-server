@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -37,8 +38,8 @@ from ..storage.models import (
 )
 from ..storage.objects import ObjectStore
 from ..storage.repository import Repository
-from .agent_config import AgentConfigError, parse_agent_config
-from .assembly import SNAPSHOT, WORKSPACE_FILE, AssemblyStore
+from .agent_config import WORKSPACE_KINDS, AgentConfigError, parse_agent_config
+from .assembly import WORKSPACE_FILE, AssemblyStore
 from .backpressure import TenantGuard, TokenBucket
 from .derive import parse_line
 from .locks import KeyedLocks
@@ -48,6 +49,7 @@ from .session_meta import (
     parse_rfc3339,
     parse_session_meta,
 )
+from .snapshots import SNAPSHOT_CHANNEL, SNAPSHOT_CHUNK_CHANNEL, SnapshotAssembler
 from .trajectory import TrajectoryStore
 from .workspace import (
     WorkspaceManifestError,
@@ -83,6 +85,17 @@ KNOWN_KINDS = frozenset(
         KIND_WORKSPACE_FILE,
         KIND_AGENT_ENV,
         KIND_REPO_IDENTITY,
+    }
+)
+
+# 这些单元的重放允许"重新物化"中间态：分片/清单可能因重启或 TTL 释放而丢失，
+# 而它们的收据已 committed，客户端不会再补发。副作用幂等（同一内容 → 同一
+# 对象/分片），不产生新的持久事实，响应仍是 duplicates（§2.2）。
+_REDELIVER_KINDS = frozenset(
+    {
+        KIND_SNAPSHOT_CHUNK,
+        KIND_SNAPSHOT_MANIFEST,
+        KIND_WORKSPACE_FILE,
     }
 )
 
@@ -163,13 +176,19 @@ class BatchProcessor:
         objects: ObjectStore,
         assemblies: AssemblyStore,
         trajectory: TrajectoryStore,
+        assembler: SnapshotAssembler,
     ) -> None:
         self.settings = settings
         self.repository = repository
         self.objects = objects
         self.assemblies = assemblies
         self.trajectory = trajectory
-        self.rate_limiter = TokenBucket(
+        self.assembler = assembler
+        self.user_limiter = TokenBucket(
+            rate_per_second=settings.rate_limit_per_user_per_second,
+            burst=settings.rate_limit_per_user_burst,
+        )
+        self.tenant_limiter = TokenBucket(
             rate_per_second=settings.rate_limit_per_second,
             burst=settings.rate_limit_burst,
         )
@@ -190,6 +209,12 @@ class BatchProcessor:
 
     # ── 批处理入口 ──────────────────────────────────────────────────────────
 
+    def admit(self, principal: Principal) -> bool:
+        """两级令牌桶（§6.4-2）：单用户桶防单点刷量，租户桶是总闸。"""
+        if not self.user_limiter.take(principal.user_id):
+            return False
+        return self.tenant_limiter.take(principal.tenant)
+
     async def process(self, principal: Principal, frames: Sequence[Frame]) -> BatchResult:
         result = BatchResult()
         if not self.guard.enter(principal.tenant):
@@ -207,6 +232,9 @@ class BatchProcessor:
                 await self._process_frame(principal, frame, result)
         finally:
             self.guard.leave(principal.tenant)
+        if result.deferred and not result.retry_after_ms:
+            # deferred ⇒ 建议 retry_after：预算/前置未满足与整批背压同语义（§2.2）。
+            result.retry_after_ms = self.settings.retry_after_ms
         return result
 
     async def _process_frame(self, principal: Principal, frame: Frame, result: BatchResult) -> None:
@@ -272,7 +300,11 @@ class BatchProcessor:
         async with self._unit_locks.hold((context.tenant, context.unit_id)):
             existing = await self.repository.get_receipt(context.tenant, context.unit_id)
             if existing is not None and existing.state in TERMINAL_RECEIPT_STATES:
-                return Outcome.duplicate()
+                if context.frame.header.kind == KIND_AGENT_ENV:
+                    return await self._refresh_agent_env_envelope(context)
+                if context.frame.header.kind not in _REDELIVER_KINDS:
+                    return Outcome.duplicate()
+                return await self._redeliver(context)
             handler = self._handlers[context.frame.header.kind]
             try:
                 async with self.repository.transaction():
@@ -316,6 +348,72 @@ class BatchProcessor:
                 )
                 raise
             return outcome
+
+    async def _redeliver(self, context: UnitContext) -> Outcome:
+        """重放已 committed 的分片/清单，重新物化丢失的中间态。
+
+        收据不再改写、响应仍是 duplicates；处理器内部只做幂等副作用（同一
+        内容落同一对象/分片）。中间态仍未齐时以 RollbackUnit 收场，等同跳过。
+        """
+        try:
+            async with self.repository.transaction():
+                await self._handlers[context.frame.header.kind](context)
+        except RollbackUnit:
+            logger.info(
+                "unit_redeliver_still_incomplete",
+                extra={
+                    "event": "unit_redeliver_still_incomplete",
+                    "tenant": context.tenant,
+                    "session_id": context.session_id,
+                    "kind": context.frame.header.kind,
+                    "unit_id": context.unit_id,
+                },
+            )
+        return Outcome.duplicate()
+
+    async def _refresh_agent_env_envelope(self, context: UnitContext) -> Outcome:
+        """`agent.env` 重报：内容未变时只把信封事实收敛到较新的一次。
+
+        配置变化走新 `contentHash`（新单元、新 blob，§4.6）；**分类变化不改变载荷**，
+        所以客户端重发同一单元、只换信封的 `workspaceKind`/`capturedAt`——服务端以此
+        落地会话行三列（client-design §4.4「同一内容的新分类靠服务端对 envelope 列的
+        覆写落地」）。三条边界：
+
+        - 收据已是终态：响应仍是 `duplicates`（客户端推进 ack，不产生新持久对象）；
+        - 只有内容仍是当前锚点时才刷新——旧 blob 的重放不得回退锚点或汰换新对象；
+        - `capturedAt` 不倒退——崩溃后乱序重放的旧信封不覆盖已落库的较新事实。
+        """
+        session_id = context.session_id or ""
+        payload_sha256 = context.frame.header.payload_sha256
+        state = await self.repository.get_agent_config_anchor_state(context.tenant, session_id)
+        if state is None or state.agent_config_sha256 != payload_sha256:
+            return Outcome.duplicate()
+        workspace_kind = context.frame.header.workspace_kind
+        captured_at = parse_rfc3339(context.frame.header.captured_at)
+        if workspace_kind not in WORKSPACE_KINDS or captured_at is None:
+            return Outcome.duplicate()
+        stored = state.agent_config_captured_at
+        if stored is not None and captured_at <= stored:
+            return Outcome.duplicate()
+        async with self.repository.transaction():
+            await self.repository.set_agent_config_anchor(
+                context.tenant,
+                session_id,
+                payload_sha256,
+                workspace_kind=workspace_kind,
+                captured_at=captured_at,
+            )
+        logger.info(
+            "agent_env_envelope_refreshed",
+            extra={
+                "event": "agent_env_envelope_refreshed",
+                "tenant": context.tenant,
+                "session_id": session_id,
+                "workspace_kind": workspace_kind,
+                "captured_at": captured_at.isoformat(),
+            },
+        )
+        return Outcome.duplicate()
 
     # ── 收据与隔离 ──────────────────────────────────────────────────────────
 
@@ -429,20 +527,42 @@ class BatchProcessor:
                 "snapshot.chunk scope must be chunk:<content_hash>:<index>",
             )
         content_hash = match.group("sha")
-        index = int(match.group("index"))
-        result = await self.assemblies.add_slice(
-            tenant=context.tenant,
-            session_id=context.session_id,
-            kind=SNAPSHOT,
-            target=content_hash,
-            index=index,
-            data=context.payload,
-            chunk_sha256=context.frame.header.payload_sha256,
-        )
-        if result.complete and result.data is not None:
-            return await self._store_assembled(
-                context, sha256=content_hash, data=result.data, channel="session-snapshot"
+        # 分块本身就是内容寻址对象：落 OBS + 登记（幂等，重放即重新物化）。
+        await self.objects.put(context.tenant, context.frame.header.payload_sha256, context.payload)
+        await self.repository.put_object(
+            ObjectRecord(
+                tenant=context.tenant,
+                sha256=context.frame.header.payload_sha256,
+                size_bytes=len(context.payload),
+                channel=SNAPSHOT_CHUNK_CHANNEL,
+                state=OBJECT_VERIFIED,
             )
+        )
+        # 该快照的清单已到（登记为缺块行）→ 缺口一补齐就立刻拼装整份快照。
+        pending = await self.repository.get_object(context.tenant, content_hash)
+        if (
+            pending is not None
+            and pending.channel == SNAPSHOT_CHANNEL
+            and pending.state == OBJECT_MISSING
+            and pending.missing_hashes
+        ):
+            assembled = await self.assembler.assemble(
+                tenant=context.tenant,
+                session_id=context.session_id,
+                content_hash=content_hash,
+                chunk_hashes=pending.missing_hashes,
+            )
+            if assembled:
+                logger.info(
+                    "snapshot_assembled",
+                    extra={
+                        "event": "snapshot_assembled",
+                        "tenant": context.tenant,
+                        "session_id": context.session_id,
+                        "content_hash": content_hash,
+                        "trigger": "snapshot.chunk",
+                    },
+                )
         return Outcome.committed()
 
     async def _handle_snapshot_manifest(self, context: UnitContext) -> Outcome:
@@ -497,12 +617,51 @@ class BatchProcessor:
                 RejectionCode.SCHEMA_INVALID,
                 "snapshot.manifest chunk count does not match size/chunk_size",
             )
-        self.assemblies.record_expected_chunks(context.tenant, content_hash, tuple(chunks))
-        assembled = await self.assemblies.assemble_existing(context.tenant, SNAPSHOT, content_hash)
-        if assembled.complete and assembled.data is not None:
-            return await self._store_assembled(
-                context, sha256=content_hash, data=assembled.data, channel="session-snapshot"
+        if size > self.settings.max_snapshot_bytes:
+            return Outcome.rejected(
+                RejectionCode.PAYLOAD_TOO_LARGE,
+                f"snapshot.manifest size {size} bytes exceeds the limit",
             )
+        existing = await self.repository.get_object(context.tenant, content_hash)
+        if existing is not None and existing.state == OBJECT_VERIFIED:
+            return Outcome.committed()
+        missing = await self.assembler.missing_chunks(context.tenant, chunks)
+        if not missing:
+            # 分块对象都在：就地拼装。拼不出来（哈希不符/对象丢失）按载荷错误处理。
+            assembled = await self.assembler.assemble(
+                tenant=context.tenant,
+                session_id=context.session_id,
+                content_hash=content_hash,
+                chunk_hashes=chunks,
+            )
+            if not assembled:
+                return Outcome.rejected(
+                    RejectionCode.PAYLOAD_SHA_MISMATCH,
+                    "snapshot chunks do not reproduce the declared content_hash",
+                )
+            logger.info(
+                "snapshot_assembled",
+                extra={
+                    "event": "snapshot_assembled",
+                    "tenant": context.tenant,
+                    "session_id": context.session_id,
+                    "content_hash": content_hash,
+                    "trigger": "snapshot.manifest",
+                },
+            )
+            return Outcome.committed()
+        # 清单是持久事实：登记缺块行（missing_hashes = 期望分块清单），
+        # 后续任意分片到达或协商端点都能据此继续拼装（跨重启成立）。
+        await self.repository.put_object(
+            ObjectRecord(
+                tenant=context.tenant,
+                sha256=content_hash,
+                size_bytes=size,
+                channel=SNAPSHOT_CHANNEL,
+                state=OBJECT_MISSING,
+                missing_hashes=tuple(chunks),
+            )
+        )
         return Outcome.committed()
 
     async def _store_assembled(
@@ -549,6 +708,9 @@ class BatchProcessor:
             data=context.payload,
             chunk_sha256=context.frame.header.payload_sha256,
         )
+        if result.over_budget:
+            # 超预算是背压不是淘汰：无副作用，客户端按退避重发（§3.2-4）。
+            return Outcome.deferred("staging budget exceeded; retry later")
         if result.complete and result.data is not None:
             return await self._store_assembled(
                 context, sha256=target, data=result.data, channel="workspace-file"
@@ -570,6 +732,8 @@ class BatchProcessor:
             manifest = parse_manifest(context.payload)
             refs = content_refs(manifest)
             identity = repository_identity(manifest)
+            # 忽略清单校验（含单条 path ≤ 512）与结构校验同口径 → schema_invalid。
+            ignored_count, ignored_truncated, ignored_entries = ignored_summary(manifest)
         except WorkspaceManifestError as exc:
             return Outcome.rejected(RejectionCode.SCHEMA_INVALID, str(exc))
 
@@ -600,7 +764,6 @@ class BatchProcessor:
             )
         )
         counts = summary_counts(manifest)
-        ignored_count, ignored_truncated, ignored_entries = ignored_summary(manifest)
         head = head_fields(manifest)
         capture = manifest.get("capture")
         capture_map = capture if isinstance(capture, dict) else {}
@@ -656,16 +819,9 @@ class BatchProcessor:
         if snapshot is None or snapshot.state != OBJECT_VERIFIED:
             return Outcome.deferred("snapshot content_hash is not verified yet")
 
-        agent_sha = meta.agent_config_sha256
-        if agent_sha is not None:
-            agent_object = await self.repository.get_object(context.tenant, agent_sha)
-            if agent_object is None or agent_object.state != OBJECT_VERIFIED:
-                return Outcome.deferred("agent config is not verified yet")
-        else:
-            agent_sha = await self.repository.get_agent_config_anchor(
-                context.tenant, context.session_id
-            )
-
+        # 环境三列（agent_config_sha256 / workspace_kind / agent_config_captured_at）
+        # 只由 agent.env 写（agent-config-sync §1）：session.meta 不解析、不校验、
+        # 不清除；行建立时由仓储从锚点 coalesce。
         observed_at = datetime.now(UTC)
         record = SessionRecord(
             tenant=context.tenant,
@@ -689,8 +845,6 @@ class BatchProcessor:
             snapshot_sha256=content_hash,
             snapshot_size=snapshot.size_bytes,
             snapshot_state="ok",
-            agent_config_sha256=agent_sha,
-            workspace_kind=meta.workspace_kind,
             linked="linked",
         )
         advanced = await self.repository.upsert_session(record)
@@ -732,6 +886,18 @@ class BatchProcessor:
                 RejectionCode.SCHEMA_INVALID,
                 "agent.env scope sha256 must equal sha256(payload)",
             )
+        # 信封（agent-config-sync §1）：workspaceKind 三值枚举 + capturedAt 必填 RFC3339。
+        workspace_kind = context.frame.header.workspace_kind
+        if workspace_kind not in WORKSPACE_KINDS:
+            return Outcome.rejected(
+                RejectionCode.SCHEMA_INVALID,
+                f"agent.env envelope workspaceKind must be one of {sorted(WORKSPACE_KINDS)}",
+            )
+        captured_at = parse_rfc3339(context.frame.header.captured_at)
+        if captured_at is None:
+            return Outcome.rejected(
+                RejectionCode.SCHEMA_INVALID, "agent.env envelope capturedAt must be RFC3339"
+            )
         try:
             parse_agent_config(context.payload, max_bytes=self.settings.agent_env_max_bytes)
         except AgentConfigError as exc:
@@ -746,7 +912,18 @@ class BatchProcessor:
                 state=OBJECT_VERIFIED,
             )
         )
-        await self.repository.set_agent_config_anchor(context.tenant, context.session_id, sha256)
+        # 覆写汰换（agent-config-sync §1）：同会话换新配置时，旧引用对象置
+        # superseded（OBS 字节保留），三列随锚点推进。
+        previous = await self.repository.get_agent_config_anchor(context.tenant, context.session_id)
+        if previous is not None and previous != sha256:
+            await self.repository.mark_object_superseded(context.tenant, previous)
+        await self.repository.set_agent_config_anchor(
+            context.tenant,
+            context.session_id,
+            sha256,
+            workspace_kind=workspace_kind,
+            captured_at=captured_at,
+        )
         return Outcome.committed()
 
     async def _handle_repo_identity(self, context: UnitContext) -> Outcome:
@@ -789,21 +966,21 @@ class BatchProcessor:
             return
         self._last_sweep = now
         for missing in self.assemblies.expired():
-            channel = "session-snapshot" if missing.kind == SNAPSHOT else "workspace-file"
             async with self.repository.transaction():
                 await self.repository.put_object(
                     ObjectRecord(
                         tenant=missing.tenant,
                         sha256=missing.target,
                         size_bytes=0,
-                        channel=channel,
+                        channel="workspace-file",
                         state=OBJECT_MISSING,
                         missing_hashes=missing.missing_hashes,
                     )
                 )
-                await self.repository.set_session_body_state(
-                    missing.tenant, missing.session_id, "missing"
-                )
+                if missing.session_id:
+                    await self.repository.set_session_body_state(
+                        missing.tenant, missing.session_id, "missing"
+                    )
             logger.warning(
                 "assembly_missing",
                 extra={
@@ -814,6 +991,12 @@ class BatchProcessor:
                     "target": missing.target,
                     "missing": len(missing.missing_hashes),
                 },
+            )
+        reclaimed = await asyncio.to_thread(self.assemblies.cleanup_expired)
+        if reclaimed:
+            logger.info(
+                "staging_orphans_reclaimed",
+                extra={"event": "staging_orphans_reclaimed", "directories": reclaimed},
             )
 
 

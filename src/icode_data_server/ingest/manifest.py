@@ -1,7 +1,11 @@
 """缺块协商（`POST /v1/session/{session_id}/manifest`，server-acceptance §2.3）。
 
-只读、无副作用。`acked_last_sequence` 是**已确认提交**的最大 sequence（不是"收到过"的最大值），
+`acked_last_sequence` 是**已确认提交**的最大 sequence（不是"收到过"的最大值），
 用于客户端校正本地偏移；未知会话按"什么都不存在"处理，不泄漏存在性。
+
+本端点除回答缺口外还有一项修复职责：快照分块是内容寻址对象，若客户端上报的
+分块已全部登记而整份快照尚未拼出（典型场景：进程重启丢了内存态、清单侧组装
+被打断），这里就地补装——协商一次即治愈，客户端无需重发任何帧。
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import json
 from dataclasses import dataclass
 
 from ..storage.repository import Repository
-from .assembly import AssemblyStore
+from .snapshots import SnapshotAssembler
 from .trajectory import TrajectoryStore
 
 
@@ -72,11 +76,11 @@ class ManifestService:
     def __init__(
         self,
         repository: Repository,
-        assemblies: AssemblyStore,
+        assembler: SnapshotAssembler,
         trajectory: TrajectoryStore,
     ) -> None:
         self.repository = repository
-        self.assemblies = assemblies
+        self.assembler = assembler
         self.trajectory = trajectory
 
     async def reconcile(self, *, tenant: str, session_id: str, request: ManifestRequest) -> dict:
@@ -85,9 +89,16 @@ class ManifestService:
         if request.content_hash is not None:
             record = await self.repository.get_object(tenant, request.content_hash)
             known_snapshot = record is not None and record.state == "verified"
-            if not known_snapshot:
-                staged = self.assemblies.staged_hashes(tenant, request.content_hash)
-                missing_chunks = [sha for sha in request.chunk_hashes if sha not in staged]
+            if not known_snapshot and request.chunk_hashes:
+                missing_chunks = await self.assembler.missing_chunks(tenant, request.chunk_hashes)
+                if not missing_chunks:
+                    # 分块对象全部在场而快照未拼出：就地补装（重启后的修复路径）。
+                    known_snapshot = await self.assembler.assemble(
+                        tenant=tenant,
+                        session_id=session_id,
+                        content_hash=request.content_hash,
+                        chunk_hashes=request.chunk_hashes,
+                    )
 
         verified_files = await self.repository.verified_objects(tenant, request.file_shas)
         missing_files = [sha for sha in request.file_shas if sha not in verified_files]

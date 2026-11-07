@@ -34,7 +34,7 @@ async def test_missing_chunks_before_snapshot_completes(client) -> None:
     assert response["known_snapshot"] is False
     assert response["missing_chunk_hashes"] == hashes[1:]
 
-    # 补齐后：没有缺块
+    # 补齐后：没有缺块，且协商端点就地补装（重启后清单侧组装被打断的修复路径）
     for index in range(1, len(chunks)):
         await client.post_batch(snapshot_frame(index, chunks[index], content_hash))
     response = (
@@ -48,6 +48,7 @@ async def test_missing_chunks_before_snapshot_completes(client) -> None:
     ).json()
     assert response["known_snapshot"] is True
     assert response["missing_chunk_hashes"] == []
+    assert await client.object_store.get("dev", content_hash) == content
 
 
 async def test_missing_file_shas(client) -> None:

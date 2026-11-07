@@ -1,6 +1,7 @@
-"""背压：per-tenant 令牌桶 + 并发批次计数（server-acceptance §6.4）。
+"""背压：请求闸门 + per-user/per-tenant 令牌桶 + 并发批次计数（server-acceptance §6.4）。
 
-- 请求速率超限 → `429` + `Retry-After`（由 API 层转成响应）；
+- 请求闸门满 → API 层 `503` + `Retry-After`（在读体之前拒绝，保护内存）；
+- 令牌桶超限 → `429` + `Retry-After`（单用户桶防单点刷量，租户桶是总闸）；
 - 单租户并发批次超限 → 整批 `deferred` + `retry_after_ms`（无副作用，客户端退避重发）。
 """
 
@@ -32,6 +33,32 @@ class TokenBucket:
         if self._rate <= 0:
             return 0
         return max(1, int(round(1.0 / self._rate)))
+
+
+class RequestGate:
+    """进程级并发闸门：在读取请求体之前限制同时在处理的请求数（§6.4-1）。
+
+    计数只在事件循环内同步增减（中间没有 ``await``），因此不需要额外加锁。
+    闸门满了立即拒绝，不排队——排队会把内存问题推迟到读体之后。
+    """
+
+    def __init__(self, *, max_concurrent: int) -> None:
+        self._max_concurrent = max(int(max_concurrent), 1)
+        self._inflight = 0
+
+    def try_enter(self) -> bool:
+        if self._inflight >= self._max_concurrent:
+            return False
+        self._inflight += 1
+        return True
+
+    def leave(self) -> None:
+        if self._inflight > 0:
+            self._inflight -= 1
+
+    @property
+    def inflight(self) -> int:
+        return self._inflight
 
 
 class TenantGuard:

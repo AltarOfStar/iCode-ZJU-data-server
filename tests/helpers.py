@@ -26,6 +26,7 @@ def unit(
     v: int = 1,
     unit_id: str | None = None,
     payload_sha: str | None = None,
+    extra_header: dict[str, Any] | None = None,
 ) -> bytes:
     digest = payload_sha if payload_sha is not None else payload_sha256(payload)
     header = {
@@ -39,6 +40,8 @@ def unit(
         "reset": reset,
         "unit_id": unit_id if unit_id is not None else unit_id_for(kind, session_id, scope, digest),
     }
+    if extra_header:
+        header.update(extra_header)
     return encode_frame(header, payload)
 
 
@@ -94,18 +97,13 @@ def session_meta_payload(
     content_hash: str,
     *,
     updated_at: str = "2026-11-06T10:00:00Z",
-    workspace_kind: str | None = "git",
-    agent_config_sha: str | None = None,
     title: str = "s",
     repository_identities: list[str] | None = None,
 ) -> bytes:
-    environment: dict[str, Any] = {}
-    if workspace_kind is not None:
-        environment["workspaceKind"] = workspace_kind
-    if agent_config_sha is not None:
-        environment["agentConfigSha256"] = agent_config_sha
-        environment["agentConfigSize"] = 123
+    """`session/1.0`：不携带 `environment`（agent-config-sync §1，携带即拒绝）。"""
     document = {
+        "schema": "session/1.0",
+        "sessionId": SESSION,
         "schemaVersion": 1,
         "title": title,
         "agentProfile": "default",
@@ -119,7 +117,6 @@ def session_meta_payload(
         "messageCount": 9,
         "totalTokens": 1234,
         "repositoryIdentities": repository_identities or [],
-        "environment": environment,
     }
     return json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
 
@@ -215,21 +212,58 @@ def workspace_file_frames(
 # ── agent.env / repo.identity ───────────────────────────────────────────────
 
 
-def agent_env_payload(*, schema: str = "agent-config/1.0", redacted: Any = None) -> bytes:
+def agent_env_payload(
+    *,
+    schema: str = "agent-config/1.0",
+    redacted: Any = None,
+    sections: dict[str, str] | None = None,
+    truncated: bool = False,
+    absent: tuple[str, ...] = (),
+) -> bytes:
+    """`agent-config/1.0`：`sections` 五键 + `truncated` 为必填成员（agent-config-sync §1）。"""
+    all_sections = {
+        "profile": "captured",
+        "model": "captured",
+        "skills": "captured",
+        "mcp": "captured",
+        "hooks": "captured",
+    }
+    for key in absent:
+        all_sections[key] = "absent"
+    if sections is not None:
+        all_sections.update(sections)
     document = {
         "schema": schema,
         "appVersion": "1.2.3",
         "platform": "win32-x64",
         "profile": {"name": "default", "yaml": "model: claude\n"},
         "model": {"profileId": "p1", "provider": "anthropic", "modelId": "claude", "params": {}},
-        "tools": {"enabled": ["read_file"], "kinds": {}},
         "skills": [],
         "mcp": {"servers": []},
         "hooks": {"count": 0, "events": []},
+        "sections": all_sections,
         "settingsDigest": "b" * 64,
         "redacted": ["api_key", "headers"] if redacted is None else redacted,
+        "truncated": truncated,
     }
     return json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+def agent_env_frame(
+    payload: bytes,
+    *,
+    session_id: str = SESSION,
+    workspace_kind: str = "git",
+    captured_at: str = "2026-11-06T09:59:58Z",
+) -> bytes:
+    """带 §1 信封字段（workspaceKind / capturedAt）的 agent.env 帧。"""
+    return unit(
+        "agent.env",
+        f"agentenv:{sha(payload)}",
+        payload,
+        session_id=session_id,
+        extra_header={"workspaceKind": workspace_kind, "capturedAt": captured_at},
+    )
 
 
 def repository_payload(

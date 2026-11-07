@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from .. import __version__
+from ..config import Settings
 from ..frames import FrameError, decode_frames
 from ..ingest.manifest import ManifestRequestError, parse_manifest_request
 from .auth import bearer_principal
@@ -39,98 +40,127 @@ async def post_batch(request: Request) -> Response:
     await services.start()
     processor = services.require_processor()
 
-    if not processor.rate_limiter.take(principal.tenant):
-        retry_after = settings.rate_limit_retry_after_s
-        return JSONResponse(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"error": "rate_limited", "retry_after_ms": retry_after * 1000},
-            headers={"Retry-After": str(retry_after)},
-        )
-
-    body = await _read_limited(request, settings.max_body_bytes)
-    body = _maybe_decompress(request, body, settings.max_expanded_bytes)
+    # §6.4-1：闸门在读体之前拒绝，避免 64 MiB 解压缓冲先被分配出去。
+    if not services.gate.try_enter():
+        return _overloaded(settings)
     try:
-        frames = decode_frames(body)
-    except FrameError as exc:
-        logger.warning(
-            "batch_frame_error",
-            extra={"event": "batch_frame_error", "tenant": principal.tenant, "reason": str(exc)},
-        )
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": "frame_format", "message": str(exc)},
-        )
-    if len(frames) > settings.max_frames_per_batch:
-        return JSONResponse(
-            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
-            content={
-                "error": "too_many_frames",
+        if not processor.admit(principal):
+            return _rate_limited(settings)
+
+        body = await _read_limited(request, settings.max_body_bytes)
+        body = _maybe_decompress(request, body, settings.max_expanded_bytes)
+        try:
+            frames = decode_frames(body)
+        except FrameError as exc:
+            logger.warning(
+                "batch_frame_error",
+                extra={
+                    "event": "batch_frame_error",
+                    "tenant": principal.tenant,
+                    "reason": str(exc),
+                },
+            )
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "frame_format", "message": str(exc)},
+            )
+        if len(frames) > settings.max_frames_per_batch:
+            return JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                content={
+                    "error": "too_many_frames",
+                    "frames": len(frames),
+                    "limit": settings.max_frames_per_batch,
+                },
+            )
+
+        try:
+            result = await asyncio.wait_for(
+                processor.process(principal, frames), timeout=settings.batch_timeout_s
+            )
+        except TimeoutError:
+            logger.error(
+                "batch_timeout",
+                extra={"event": "batch_timeout", "tenant": principal.tenant, "frames": len(frames)},
+            )
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"error": "batch_timeout"},
+                headers={"Retry-After": "1"},
+            )
+
+        logger.info(
+            "batch_processed",
+            extra={
+                "event": "batch_processed",
+                "tenant": principal.tenant,
                 "frames": len(frames),
-                "limit": settings.max_frames_per_batch,
+                "accepted": len(result.accepted),
+                "duplicates": len(result.duplicates),
+                "rejected": len(result.rejected),
+                "deferred": len(result.deferred),
+                "retry_after_ms": result.retry_after_ms,
             },
         )
-
-    try:
-        result = await asyncio.wait_for(
-            processor.process(principal, frames), timeout=settings.batch_timeout_s
-        )
-    except TimeoutError:
-        logger.error(
-            "batch_timeout",
-            extra={"event": "batch_timeout", "tenant": principal.tenant, "frames": len(frames)},
-        )
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"error": "batch_timeout"},
-            headers={"Retry-After": "1"},
-        )
-
-    logger.info(
-        "batch_processed",
-        extra={
-            "event": "batch_processed",
-            "tenant": principal.tenant,
-            "frames": len(frames),
-            "accepted": len(result.accepted),
-            "duplicates": len(result.duplicates),
-            "rejected": len(result.rejected),
-            "deferred": len(result.deferred),
-            "retry_after_ms": result.retry_after_ms,
-        },
-    )
-    return JSONResponse(status_code=status.HTTP_200_OK, content=result.as_response())
+        return JSONResponse(status_code=status.HTTP_200_OK, content=result.as_response())
+    finally:
+        services.gate.leave()
 
 
 @router.post("/v1/session/{session_id}/manifest")
 async def post_manifest(session_id: str, request: Request) -> Response:
+    settings = request.app.state.settings
     principal = bearer_principal(request)
     services = request.app.state.services
     await services.start()
     manifest = services.require_manifest()
 
-    body = await _read_limited(request, _MAX_MANIFEST_BODY)
+    if not services.gate.try_enter():
+        return _overloaded(settings)
     try:
-        parsed = parse_manifest_request(body)
-    except ManifestRequestError as exc:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content={"error": "manifest_format", "message": str(exc)},
+        body = await _read_limited(request, _MAX_MANIFEST_BODY)
+        try:
+            parsed = parse_manifest_request(body)
+        except ManifestRequestError as exc:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"error": "manifest_format", "message": str(exc)},
+            )
+        response = await manifest.reconcile(
+            tenant=principal.tenant, session_id=session_id, request=parsed
         )
-    response = await manifest.reconcile(
-        tenant=principal.tenant, session_id=session_id, request=parsed
+        logger.info(
+            "manifest_reconciled",
+            extra={
+                "event": "manifest_reconciled",
+                "tenant": principal.tenant,
+                "session_id": session_id,
+                "missing_chunks": len(response["missing_chunk_hashes"]),
+                "missing_files": len(response["missing_file_shas"]),
+                "known_snapshot": response["known_snapshot"],
+            },
+        )
+        return JSONResponse(status_code=status.HTTP_200_OK, content=response)
+    finally:
+        services.gate.leave()
+
+
+def _overloaded(settings: Settings) -> JSONResponse:
+    retry_after = settings.rate_limit_retry_after_s
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": "overloaded", "retry_after_ms": retry_after * 1000},
+        headers={"Retry-After": str(retry_after)},
     )
-    logger.info(
-        "manifest_reconciled",
-        extra={
-            "event": "manifest_reconciled",
-            "tenant": principal.tenant,
-            "session_id": session_id,
-            "missing_chunks": len(response["missing_chunk_hashes"]),
-            "missing_files": len(response["missing_file_shas"]),
-            "known_snapshot": response["known_snapshot"],
-        },
+
+
+def _rate_limited(settings: Settings) -> JSONResponse:
+    retry_after = settings.rate_limit_retry_after_s
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"error": "rate_limited", "retry_after_ms": retry_after * 1000},
+        headers={"Retry-After": str(retry_after)},
     )
-    return JSONResponse(status_code=status.HTTP_200_OK, content=response)
 
 
 async def _read_limited(request: Request, limit: int) -> bytes:

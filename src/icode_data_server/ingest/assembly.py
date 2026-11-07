@@ -1,11 +1,19 @@
 """字节块暂存与组装（server-acceptance §3.2）。
 
-`snapshot.chunk`（`chunk:<content_hash>:<index>`）与 `workspace.file`
-（`wsfile:<sha256>:<index>`）共用同一套机制：按目标 sha 聚合分片、按分片序拼接、
-`sha256(拼接结果) == 目标 sha` 才算组装完成。
+`workspace.file`（`wsfile:<sha256>:<index>`）按目标 sha 聚合分片、按分片序拼接、
+`sha256(拼接结果) == 目标 sha` 才算组装完成。快照分块不再走这里：它们本身是
+内容寻址对象，由 `SnapshotAssembler` 按清单拼装（见 `snapshots.py`）。
 
-分片落在本地暂存目录（内存只留元数据），受「单会话 / 单租户字节预算 + TTL」约束：
-超预算按最旧未完成组装淘汰（`assembly_evicted`），超 TTL 置缺块终态（`missing`）。
+分片落在本地暂存目录（内存只留元数据），受「单会话 / 单租户字节预算 + TTL」
+约束：
+
+- 超预算 **不淘汰**：该分片返回 `deferred`（无副作用），客户端按退避重发——
+  淘汰已收下的分片等于静默丢数据，收据又已 committed，客户端永远不会补发。
+- 超 TTL 置缺块终态（`missing`）并释放分片字节；客户端通过缺块协商得知后
+  重发，重放走 `duplicates` 的重新物化路径（§2.2），缺口治愈后状态单向推进
+  为 verified（§3.2-5）。
+- 重启后内存索引丢失，但收据仍在：客户端重发的分片以 `duplicates` 重新落盘，
+  组装照常完成；孤儿目录（客户端已消失）由 `cleanup_expired` 按 mtime 回收。
 """
 
 from __future__ import annotations
@@ -20,7 +28,6 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-SNAPSHOT = "snapshot"
 WORKSPACE_FILE = "wsfile"
 
 
@@ -29,6 +36,7 @@ class AssemblyResult:
     complete: bool
     data: bytes | None = None
     missing_indexes: tuple[int, ...] = ()
+    over_budget: bool = False
 
 
 @dataclass(slots=True)
@@ -40,8 +48,6 @@ class Assembly:
     created_at: float
     updated_at: float
     chunks: dict[int, tuple[int, str]] = field(default_factory=dict)  # index -> (size, sha)
-    # TTL 只置缺块终态，**不丢弃**已到的分片：缺口治愈后状态可单向推进为 verified（§3.2-5）。
-    marked_missing: bool = False
 
     @property
     def total_bytes(self) -> int:
@@ -78,9 +84,7 @@ class AssemblyStore:
         self._per_tenant_bytes = per_tenant_bytes
         self._ttl_s = ttl_s
         self._clock = clock
-        self._assemblies: dict[tuple[str, str, str], Assembly] = {}
-        self._expected_chunks: dict[tuple[str, str], tuple[str, ...]] = {}
-        self._staged_hashes: dict[tuple[str, str], set[str]] = {}
+        self._assemblies: dict[tuple[str, str], Assembly] = {}
         self._lock = asyncio.Lock()
 
     # ── 分片写入 ────────────────────────────────────────────────────────────
@@ -97,6 +101,8 @@ class AssemblyStore:
         chunk_sha256: str,
     ) -> AssemblyResult:
         async with self._lock:
+            if self._over_budget(tenant, session_id, len(data)):
+                return AssemblyResult(complete=False, over_budget=True)
             key = (tenant, f"{kind}:{target}")
             assembly = self._assemblies.get(key)
             now = self._clock()
@@ -111,13 +117,11 @@ class AssemblyStore:
                 )
                 self._assemblies[key] = assembly
             if index in assembly.chunks and assembly.chunks[index][1] == chunk_sha256:
-                return AssemblyResult(complete=False, missing_indexes=assembly.missing_indexes())
+                return await self._try_assemble(assembly)
             await self._write_chunk(tenant, kind, target, index, data)
             assembly.chunks[index] = (len(data), chunk_sha256)
             assembly.session_id = session_id
             assembly.updated_at = now
-            self._staged_hashes.setdefault((tenant, target), set()).add(chunk_sha256)
-            self._evict_if_needed(tenant)
             return await self._try_assemble(assembly)
 
     async def _write_chunk(
@@ -153,69 +157,20 @@ class AssemblyStore:
         self._assemblies.pop((assembly.tenant, f"{assembly.kind}:{assembly.target}"), None)
         return AssemblyResult(complete=True, data=data)
 
-    async def assemble_existing(self, tenant: str, kind: str, target: str) -> AssemblyResult:
-        assembly = self._assemblies.get((tenant, f"{kind}:{target}"))
-        if assembly is None:
-            return AssemblyResult(complete=False)
-        async with self._lock:
-            return await self._try_assemble(assembly)
+    # ── 预算：超限即背压，不淘汰 ────────────────────────────────────────────
 
-    # ── 预算与淘汰 ──────────────────────────────────────────────────────────
-
-    def _evict_if_needed(self, tenant: str) -> None:
-        mine = [item for item in self._assemblies.values() if item.tenant == tenant]
-        session_bytes: dict[str, int] = {}
-        for item in mine:
-            session_bytes[item.session_id] = (
-                session_bytes.get(item.session_id, 0) + item.total_bytes
-            )
-        for session_id, total in list(session_bytes.items()):
-            if total <= self._per_session_bytes:
+    def _over_budget(self, tenant: str, session_id: str, extra_bytes: int) -> bool:
+        session_total = 0
+        tenant_total = 0
+        for item in self._assemblies.values():
+            if item.tenant != tenant:
                 continue
-            candidates = sorted(
-                (item for item in mine if item.session_id == session_id),
-                key=lambda item: item.updated_at,
-            )
-            for item in candidates:
-                if session_bytes[session_id] <= self._per_session_bytes:
-                    break
-                logger.warning(
-                    "assembly_evicted",
-                    extra={
-                        "event": "assembly_evicted",
-                        "tenant": tenant,
-                        "session_id": item.session_id,
-                        "kind": item.kind,
-                        "target": item.target,
-                    },
-                )
-                session_bytes[session_id] -= item.total_bytes
-                self._drop(item)
-        total_bytes = sum(
-            item.total_bytes for item in self._assemblies.values() if item.tenant == tenant
-        )
-        if total_bytes <= self._per_tenant_bytes:
-            return
-        for item in sorted(mine, key=lambda item: item.updated_at):
-            if total_bytes <= self._per_tenant_bytes:
-                break
-            logger.warning(
-                "assembly_evicted",
-                extra={
-                    "event": "assembly_evicted",
-                    "scope": "tenant",
-                    "tenant": tenant,
-                    "session_id": item.session_id,
-                    "kind": item.kind,
-                    "target": item.target,
-                },
-            )
-            total_bytes -= item.total_bytes
-            self._drop(item)
-
-    def _drop(self, assembly: Assembly) -> None:
-        self._assemblies.pop((assembly.tenant, f"{assembly.kind}:{assembly.target}"), None)
-        self._discard(assembly.tenant, assembly.kind, assembly.target)
+            tenant_total += item.total_bytes
+            if item.session_id == session_id:
+                session_total += item.total_bytes
+        if session_total + extra_bytes > self._per_session_bytes:
+            return True
+        return tenant_total + extra_bytes > self._per_tenant_bytes
 
     def _discard(self, tenant: str, kind: str, target: str) -> None:
         shutil.rmtree(self._root / tenant / kind / target, ignore_errors=True)
@@ -223,35 +178,23 @@ class AssemblyStore:
     def _chunk_path(self, tenant: str, kind: str, target: str, index: int) -> Path:
         return self._root / tenant / kind / target / f"{index:06d}.bin"
 
-    # ── 缺块协商所需的旁路信息 ────────────────────────────────────────────────
-
-    def record_expected_chunks(
-        self, tenant: str, content_hash: str, chunk_hashes: tuple[str, ...]
-    ) -> None:
-        self._expected_chunks[(tenant, content_hash)] = chunk_hashes
-
-    def expected_chunks(self, tenant: str, content_hash: str) -> tuple[str, ...] | None:
-        return self._expected_chunks.get((tenant, content_hash))
-
-    def staged_hashes(self, tenant: str, target: str) -> set[str]:
-        return set(self._staged_hashes.get((tenant, target), set()))
-
-    def peek(self, tenant: str, kind: str, target: str) -> Assembly | None:
-        return self._assemblies.get((tenant, f"{kind}:{target}"))
-
     # ── TTL 与缺块终态 ──────────────────────────────────────────────────────
 
     def expired(self) -> list[MissingAssembly]:
+        """超时未完成的组装：置缺块终态并释放分片字节。
+
+        缺口治愈不依赖这些分片——客户端重发会重新落盘（`duplicates` 重新物化），
+        所以释放字节是安全的，也避免暂存盘只涨不降。
+        """
         now = self._clock()
         expired: list[MissingAssembly] = []
-        for assembly in list(self._assemblies.values()):
-            if assembly.marked_missing:
-                continue
+        for key, assembly in list(self._assemblies.items()):
             if now - assembly.updated_at <= self._ttl_s:
                 continue
             missing = assembly.missing_indexes()
-            hashes = tuple(f"index:{index}" for index in missing) or tuple(sorted(assembly.chunks))
-            assembly.marked_missing = True
+            hashes = tuple(f"index:{index}" for index in missing) or tuple(
+                sorted(sha for _size, sha in assembly.chunks.values())
+            )
             expired.append(
                 MissingAssembly(
                     tenant=assembly.tenant,
@@ -261,4 +204,29 @@ class AssemblyStore:
                     missing_hashes=hashes,
                 )
             )
+            self._assemblies.pop(key, None)
+            self._discard(assembly.tenant, assembly.kind, assembly.target)
         return expired
+
+    def cleanup_expired(self) -> int:
+        """回收孤儿目录：索引已随重启丢失、再无人推进的暂存分片。
+
+        以目录内最新 mtime 判定闲置；活跃组装的写入会持续刷新 mtime，不会被误删。
+        返回回收的目录数。
+        """
+        if not self._root.exists():
+            return 0
+        deadline = self._clock() - self._ttl_s
+        removed = 0
+        for target_dir in self._root.glob("*/*/*"):
+            if not target_dir.is_dir():
+                continue
+            try:
+                newest = max(entry.stat().st_mtime for entry in target_dir.iterdir())
+            except (FileNotFoundError, ValueError):
+                newest = target_dir.stat().st_mtime
+            if newest >= deadline:
+                continue
+            shutil.rmtree(target_dir, ignore_errors=True)
+            removed += 1
+        return removed

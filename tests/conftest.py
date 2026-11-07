@@ -77,6 +77,8 @@ def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
         staging_root=tmp_path / "staging",
         rate_limit_per_second=0.0,
         rate_limit_burst=1000.0,
+        rate_limit_per_user_per_second=0.0,
+        rate_limit_per_user_burst=1000.0,
         assembly_sweep_interval_s=0.0,
     )
     return replace(base, **overrides) if overrides else base

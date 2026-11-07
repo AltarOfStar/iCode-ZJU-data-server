@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 SESSION_SCHEMA = "session/1.0"
-WORKSPACE_KINDS = frozenset({"git", "non_git", "no_repo"})
 
 
 class SessionMetaError(ValueError):
@@ -33,9 +32,6 @@ class SessionMeta:
     message_count: int = 0
     total_tokens: int = 0
     repository_identities: tuple[str, ...] = ()
-    agent_config_sha256: str | None = None
-    agent_config_size: int | None = None
-    workspace_kind: str | None = None
 
 
 def parse_session_meta(payload: bytes) -> SessionMeta:
@@ -48,16 +44,13 @@ def parse_session_meta(payload: bytes) -> SessionMeta:
     schema = document.get("schemaVersion")
     if schema is not None and not isinstance(schema, int):
         raise SessionMetaError("session.meta schemaVersion must be an integer")
-    environment = document.get("environment")
-    environment_map = environment if isinstance(environment, dict) else {}
-    workspace_kind = environment_map.get("workspaceKind")
-    if workspace_kind is not None and workspace_kind not in WORKSPACE_KINDS:
+    if "environment" in document:
+        # `session/1.0` 不携带环境引用（agent-config-sync §1）：三列只由 agent.env 写。
+        # 按未知字段显式拒绝，不做兼容读取。
         raise SessionMetaError(
-            f"environment.workspaceKind must be one of {sorted(WORKSPACE_KINDS)}"
+            "session.meta no longer carries environment;"
+            " agent-config facts arrive on agent.env frames"
         )
-    agent_sha = environment_map.get("agentConfigSha256")
-    if agent_sha is not None and (not isinstance(agent_sha, str) or len(agent_sha) != 64):
-        raise SessionMetaError("environment.agentConfigSha256 must be a sha256 hex digest")
     identities = document.get("repositoryIdentities")
     if identities is None:
         repository_identities: tuple[str, ...] = ()
@@ -80,9 +73,6 @@ def parse_session_meta(payload: bytes) -> SessionMeta:
         message_count=_count(document.get("messageCount")),
         total_tokens=_count(document.get("totalTokens")),
         repository_identities=repository_identities,
-        agent_config_sha256=agent_sha,
-        agent_config_size=_count_or_none(environment_map.get("agentConfigSize")),
-        workspace_kind=workspace_kind,
     )
 
 

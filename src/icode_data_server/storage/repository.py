@@ -9,10 +9,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Protocol
 
 from .models import (
+    OBJECT_SUPERSEDED,
     BatchRecord,
     EventRecord,
     ObjectRecord,
@@ -53,14 +55,28 @@ class Repository(Protocol):
 
     async def verified_objects(self, tenant: str, shas: Sequence[str]) -> set[str]: ...
 
+    async def mark_object_superseded(self, tenant: str, sha256: str) -> None: ...
+
     # 会话（sessions）
     async def get_session(self, tenant: str, session_id: str) -> SessionRecord | None: ...
 
     async def upsert_session(self, record: SessionRecord) -> bool: ...
 
-    async def set_agent_config_anchor(self, tenant: str, session_id: str, sha256: str) -> None: ...
+    async def set_agent_config_anchor(
+        self,
+        tenant: str,
+        session_id: str,
+        sha256: str,
+        *,
+        workspace_kind: str | None = None,
+        captured_at: datetime | None = None,
+    ) -> None: ...
 
     async def get_agent_config_anchor(self, tenant: str, session_id: str) -> str | None: ...
+
+    async def get_agent_config_anchor_state(
+        self, tenant: str, session_id: str
+    ) -> SessionAnchor | None: ...
 
     async def set_session_body_state(self, tenant: str, session_id: str, state: str) -> None: ...
 
@@ -194,6 +210,12 @@ class MemoryRepository:
             and record.state == "verified"
         }
 
+    async def mark_object_superseded(self, tenant: str, sha256: str) -> None:
+        key = (tenant, sha256)
+        record = self.objects.get(key)
+        if record is not None and record.state != OBJECT_SUPERSEDED:
+            self.objects[key] = replace(record, state=OBJECT_SUPERSEDED)
+
     # 会话
 
     async def get_session(self, tenant: str, session_id: str) -> SessionRecord | None:
@@ -204,10 +226,15 @@ class MemoryRepository:
         existing = self.sessions.get(key)
         if existing is None:
             merged = record
-            if merged.agent_config_sha256 is None:
-                anchor = self.anchors.get(key)
-                if anchor is not None:
-                    merged = merged.with_updates(agent_config_sha256=anchor.agent_config_sha256)
+            anchor = self.anchors.get(key)
+            if anchor is not None:
+                # 环境三列只由 agent.env 写：建行时从锚点 coalesce（agent-config-sync §1）。
+                merged = merged.with_updates(
+                    agent_config_sha256=record.agent_config_sha256 or anchor.agent_config_sha256,
+                    workspace_kind=record.workspace_kind or anchor.workspace_kind,
+                    agent_config_captured_at=record.agent_config_captured_at
+                    or anchor.agent_config_captured_at,
+                )
             self.sessions[key] = merged
             return True
         if _anchor_key(record) <= _anchor_key(existing):
@@ -219,24 +246,42 @@ class MemoryRepository:
         merged = record.with_updates(
             repository_identities=identities,
             agent_config_sha256=record.agent_config_sha256 or existing.agent_config_sha256,
+            workspace_kind=record.workspace_kind or existing.workspace_kind,
+            agent_config_captured_at=record.agent_config_captured_at
+            or existing.agent_config_captured_at,
             created_at=record.created_at or existing.created_at,
         )
         self.sessions[key] = merged
         return True
 
-    async def set_agent_config_anchor(self, tenant: str, session_id: str, sha256: str) -> None:
+    async def set_agent_config_anchor(
+        self,
+        tenant: str,
+        session_id: str,
+        sha256: str,
+        *,
+        workspace_kind: str | None = None,
+        captured_at: datetime | None = None,
+    ) -> None:
         key = (tenant, session_id)
         previous = self.anchors.get(key)
-        self.anchors[key] = SessionAnchor(
+        anchor = SessionAnchor(
             tenant=tenant,
             session_id=session_id,
             agent_config_sha256=sha256,
-            workspace_kind=previous.workspace_kind if previous else None,
+            workspace_kind=workspace_kind or (previous.workspace_kind if previous else None),
+            agent_config_captured_at=captured_at
+            or (previous.agent_config_captured_at if previous else None),
             updated_at=NOW(),
         )
+        self.anchors[key] = anchor
         session = self.sessions.get(key)
-        if session is not None and session.agent_config_sha256 != sha256:
-            self.sessions[key] = session.with_updates(agent_config_sha256=sha256)
+        if session is not None:
+            self.sessions[key] = session.with_updates(
+                agent_config_sha256=anchor.agent_config_sha256,
+                workspace_kind=anchor.workspace_kind,
+                agent_config_captured_at=anchor.agent_config_captured_at,
+            )
 
     async def get_agent_config_anchor(self, tenant: str, session_id: str) -> str | None:
         session = self.sessions.get((tenant, session_id))
@@ -244,6 +289,22 @@ class MemoryRepository:
             return session.agent_config_sha256
         anchor = self.anchors.get((tenant, session_id))
         return anchor.agent_config_sha256 if anchor else None
+
+    async def get_agent_config_anchor_state(
+        self, tenant: str, session_id: str
+    ) -> SessionAnchor | None:
+        """三列现状：会话行优先（`session.meta` 落地后以行为准），否则用锚点。"""
+        key = (tenant, session_id)
+        session = self.sessions.get(key)
+        if session is not None and session.agent_config_sha256:
+            return SessionAnchor(
+                tenant=tenant,
+                session_id=session_id,
+                agent_config_sha256=session.agent_config_sha256,
+                workspace_kind=session.workspace_kind,
+                agent_config_captured_at=session.agent_config_captured_at,
+            )
+        return self.anchors.get(key)
 
     async def set_session_body_state(self, tenant: str, session_id: str, state: str) -> None:
         key = (tenant, session_id)
@@ -306,8 +367,17 @@ class MemoryRepository:
     async def upsert_workspace_state(self, record: WorkspaceStateRecord) -> None:
         key = (record.tenant, record.session_id, record.repository_identity)
         existing = self.workspaces.get(key)
-        if existing is not None and _dt(existing.captured_at) > _dt(record.captured_at):
-            return
+        if existing is not None:
+            if _dt(existing.captured_at) > _dt(record.captured_at):
+                return
+            # 忽略清单首采冻结（agent-config-sync §2-4）：清单＝"会话开始时的排除口径"，
+            # 重采只推进镜像列，不改写三列。
+            record = replace(
+                record,
+                ignored_count=existing.ignored_count,
+                ignored_truncated=existing.ignored_truncated,
+                ignored_entries=existing.ignored_entries,
+            )
         self.workspaces[key] = record
 
     async def list_workspace_states(
