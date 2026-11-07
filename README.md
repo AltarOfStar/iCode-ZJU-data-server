@@ -17,7 +17,8 @@ src/icode_data_server/
     processor.py    # 单元分发、幂等收据、deferred 回滚、隔离区、背压
     derive.py       # 同构派生器（纯函数：切窗 / 白名单抽取 / turns / 代际）
     trajectory.py   # 轨迹行缓冲 + 窗口持久化
-    assembly.py     # 字节块暂存与组装（快照块 / 工作区文件块）
+    assembly.py     # 工作区分片暂存与组装（快照分块是对象，见 snapshots.py）
+   snapshots.py    # 快照拼装：分块内容寻址 + 清单驱动（增量/重启可恢复）
     workspace.py    # IGWS 容器拼装（确定性纯函数）
     session_meta.py # session/1.0 白名单校验
     agent_config.py # agent-config/1.0 校验
@@ -53,7 +54,7 @@ uv run ruff check . && uv run ruff format --check .
 ```
 
 默认配置零外部依赖：`REPOSITORY_BACKEND=memory` + `OBJECT_STORE_BACKEND=local`，对象落在 `data/objects/`，
-分片暂存在 `data/staging/`（`data/` 已在 `.gitignore` 中）。
+工作区分片暂存在 `data/staging/`（`data/` 已在 `.gitignore` 中；快照分块不走暂存，直接进对象库）。
 
 ## 配置（环境变量）
 
@@ -70,17 +71,29 @@ uv run ruff check . && uv run ruff format --check .
 | `ICODE_DS_AUTH_DISABLED` | `0` | 仅本地开发：缺 token 时按 `default/anonymous` |
 | `ICODE_DS_HOST` / `ICODE_DS_PORT` | `127.0.0.1` / `8080` | 监听地址 |
 | `ICODE_DS_MAX_BODY_BYTES` | 16 MiB | 请求体解压前上限（超限 `413`） |
-| `ICODE_DS_MAX_EXPANDED_BYTES` | 64 MiB | 解压后上限（超限 `413`） |
+| `ICODE_DS_MAX_EXPANDED_BYTES` | 16 MiB | 解压后上限（超限 `413`；客户端单批未压缩 ≤ 8 MiB） |
 | `ICODE_DS_MAX_FRAME_PAYLOAD_BYTES` | 1 MiB | 单帧载荷上限（超限按 `payload_too_large` 拒绝） |
 | `ICODE_DS_MAX_FRAMES_PER_BATCH` | 4096 | 单批帧数上限（超限 `413`） |
-| `ICODE_DS_BATCH_TIMEOUT_S` | 30 | 单批处理上限（超时 `503`） |
-| `ICODE_DS_RATE_LIMIT_PER_SECOND` / `ICODE_DS_RATE_LIMIT_BURST` | 25 / 50 | 单租户令牌桶（超限 `429` + `Retry-After`） |
-| `ICODE_DS_MAX_INFLIGHT_BATCHES` | 32 | 单租户并发批次（超限整批 `deferred`） |
-| `ICODE_DS_STAGING_ROOT` | `data/staging` | 分片暂存目录 |
-| `ICODE_DS_STAGING_BYTES_PER_SESSION` / `..._PER_TENANT` | 64 MiB / 2 GiB | 组装预算（超限按最旧淘汰） |
+| `ICODE_DS_BATCH_TIMEOUT_S` | 8 | 单批处理上限（短于客户端 10 s 超时；超时 `503`） |
+| `ICODE_DS_MAX_CONCURRENT_REQUESTS` | 64 | 进程级请求闸门，读体之前拒绝（超限 `503 overloaded` + `Retry-After`） |
+| `ICODE_DS_RATE_LIMIT_PER_USER_PER_SECOND` / `..._PER_USER_BURST` | 5 / 10 | 单用户令牌桶（超限 `429` + `Retry-After`） |
+| `ICODE_DS_RATE_LIMIT_PER_SECOND` / `ICODE_DS_RATE_LIMIT_BURST` | 50 / 100 | 单租户令牌桶总量（超限 `429`） |
+| `ICODE_DS_MAX_INFLIGHT_BATCHES` | 64 | 单租户并发批次（超限整批 `deferred`） |
+| `ICODE_DS_STAGING_ROOT` | `data/staging` | 分片暂存目录（单独挂盘，按额度监控） |
+| `ICODE_DS_STAGING_BYTES_PER_SESSION` / `..._PER_TENANT` | 64 MiB / 4 GiB | 组装预算（超限按最旧淘汰） |
+| `ICODE_DS_POSTGRES_POOL_MIN_SIZE` / `..._MAX_SIZE` / `..._TIMEOUT_S` | 2 / 20 / 5 | asyncpg 连接池与取连接超时 |
 | `ICODE_DS_ASSEMBLY_TTL_S` | 86400 | 缺块终态 TTL |
 | `ICODE_DS_MAX_WINDOW_INDEX_LINES` / `ICODE_DS_MAX_WINDOW_BYTES` | 200 / 4 MiB | 切窗上限 |
 | `ICODE_DS_AGENT_ENV_MAX_BYTES` | 256 KiB | `agent.env` 载荷上限 |
+
+## 容量目标（规格 §6）
+
+- 规模：2000 注册用户 / **200 并发会话**（首期目标）；扩到 500 的前置条件见规格 §6.5。
+- 预算：入站均值 ≤ 5 MB/s（突发 ≤ 10 MB/s）、OBS ≤ 20 GB/天（需 §6.3 保留策略）、
+  PG ≤ 1k 行/s 且 ≤ 300 万行/天、组装内存 ≤ 512 MiB/租户、暂存磁盘 ≤ 4 GiB/租户（单独挂盘）、
+  进程 RSS ≤ 2 GiB、派生 CPU ≤ 2 核。
+- 背压三层：请求闸门（64 并发，`503 overloaded`）→ 单用户 5 req/s + 租户 50 req/s 令牌桶（`429`）
+  → 单租户 64 个在途批次（整批 `deferred`）。
 
 ## 已实现范围（v1）
 
@@ -95,11 +108,24 @@ uv run ruff check . && uv run ruff format --check .
 - 存储：`ObjectStore`（local / s3+OBS endpoint）与 `Repository`（memory / postgres），
   `schema.sql` 与 teams v10 在范围内表列级一致。
 
-## 尚未实现 / 已知限制
+## P0 缺陷修复状态（2026-11-07）
 
-- 进程内轨迹缓冲（未切窗的行、各代际行摘要）不持久化：进程重启后需客户端 `reset` 重放才能补齐；
+评审发现的 4 条 P0 均已修复并有用例覆盖（客户端侧的 3 条在客户端仓库同批改动）：
+
+1. **增量快照** → 分块改为内容寻址对象（`ingest/snapshots.py`）：`snapshot.manifest` 全齐即拼装，缺口补齐自动转正；
+   `test_snapshot.py` 覆盖"第二轮只发变化块仍能组装"。
+2. **暂存可恢复** → 快照不再依赖暂存；工作区分片超预算返回 `deferred`（不再淘汰）、超 TTL 释放字节；
+   重启/释放后的恢复走"`duplicates` 重新物化"或 manifest 协商（`test_workspace.py`）。
+3. **客户端协商与队头阻塞** → 客户端已接线 manifest 协商，WAL 泵按单元结清推进，不再被单个 `deferred` 单元阻塞。
+4. **postgres 零测试** → 新增 `tests/test_postgres_integration.py` 与 `tests/test_postgres_schema.py`
+   （真实 PG 18 跑通 28 项），顺带修掉 `put_object` etag 不更新与 `state` 取值域缺 CHECK 两个缺陷。
+
+剩余风险（不阻塞 200 并发目标；扩容前置条件见 `docs/server-acceptance.md` §6.5）：
+
+- 未切窗轨迹行缓冲（含各代际行摘要）仍在进程内存：重启后需客户端 `reset` 重放补齐；
   已提交窗口本身在 OBS/PG 里是权威事实。
-- 组装预算淘汰（`assembly_evicted`）后，同帧重发会被幂等收据去重 → 需由 manifest 协商后按新 scope 重传。
+- 保留与分区策略（§6.3：`ingest_receipts` 月分区、`trajectory_events` 12 个月等）未在 DDL 中建分区；
+  OBS 生命周期必须在部署侧配置，否则快照对象按轮次线性增长。
+- 会话锁 / 切窗缓冲 / 暂存索引仍是进程内存态：多副本前须先做会话亲和路由或跨进程锁（§6.5-1）。
 - `sessions` 锚点的 `observed_at` 平手裁决、`stale_report` 证据只落结构化日志（teams 无对应列）。
-- 保留与分区策略（§6.3：`ingest_receipts` 月分区、`trajectory_events` 12 个月等）未在 DDL 中建分区。
 - 未接入自身 OTel 指标（§9-5）；`event_batches` 的 `payload_etag` 等 L2 锚点列留空。

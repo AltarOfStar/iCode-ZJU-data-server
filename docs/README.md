@@ -6,6 +6,7 @@
 |---|---|
 | `server-acceptance.md` | `iCode-ZJU-wty/design/otel-reporting/server-acceptance.md`（服务端契约，本仓库的实现依据） |
 | `client-design.md` | `iCode-ZJU-wty/design/otel-reporting/client-design.md`（帧格式、单元类型、白名单载荷） |
+| `agent-config-sync.md` | `iCode-teams` 仓库 `docs/specs/data-platform/01-fact-flow-and-storage.md` §4.6 的**服务端侧同步契约**（环境复现 `agent.env` 的 ingest 与存储口径 + 差异清单；权威版本在 teams 仓库） |
 
 **规格来源：客户端仓库 `design/otel-reporting`。** 这里只是为离线查阅而复制，权威版本以客户端仓库为准；
 两处的差异一律按客户端仓库更新，不要在本目录里就地改规格。
