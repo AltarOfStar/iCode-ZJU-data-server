@@ -28,3 +28,7 @@ data/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 私有部署记录与凭据（local/ 不进 Git）
+local/
+
