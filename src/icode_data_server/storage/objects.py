@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 import threading
@@ -26,11 +27,26 @@ class ObjectStore(Protocol):
 
     async def close(self) -> None: ...
 
-    async def put(self, tenant: str, sha256: str, data: bytes) -> None: ...
+    async def put(self, tenant: str, sha256: str, data: bytes) -> str | None:
+        """写入对象，返回对象 ETag（`object_registry.etag` 的 L2 锚点；拿不到为 None）。"""
+        ...
 
     async def get(self, tenant: str, sha256: str) -> bytes: ...
 
     async def exists(self, tenant: str, sha256: str) -> bool: ...
+
+
+def content_etag(data: bytes) -> str:
+    """单段上传的 S3/OBS ETag：内容 MD5 的小写十六进制（不是安全摘要）。"""
+    return hashlib.md5(data, usedforsecurity=False).hexdigest()
+
+
+def bare_etag(value: object) -> str | None:
+    """去掉 OBS/S3 回包里的引号；没有 ETag 时返回 None。"""
+    if not isinstance(value, str):
+        return None
+    bare = value.strip().strip('"')
+    return bare or None
 
 
 class LocalObjectStore:
@@ -52,8 +68,9 @@ class LocalObjectStore:
     async def close(self) -> None:
         return None
 
-    async def put(self, tenant: str, sha256: str, data: bytes) -> None:
+    async def put(self, tenant: str, sha256: str, data: bytes) -> str | None:
         await asyncio.to_thread(self._put_sync, tenant, sha256, data)
+        return content_etag(data)
 
     def _put_sync(self, tenant: str, sha256: str, data: bytes) -> None:
         target = self.path_for(tenant, sha256)
@@ -156,17 +173,18 @@ class S3ObjectStore:
     async def close(self) -> None:
         self._client = None
 
-    async def put(self, tenant: str, sha256: str, data: bytes) -> None:
-        def _put() -> None:
-            self._ensure_client().put_object(
+    async def put(self, tenant: str, sha256: str, data: bytes) -> str | None:
+        def _put() -> str | None:
+            response = self._ensure_client().put_object(
                 Bucket=self._bucket,
                 Key=self._key(tenant, sha256),
                 Body=data,
                 ContentType="application/octet-stream",
                 Metadata={"sha256": sha256},
             )
+            return bare_etag(response.get("ETag") if isinstance(response, dict) else None)
 
-        await asyncio.to_thread(_put)
+        return await asyncio.to_thread(_put)
 
     async def get(self, tenant: str, sha256: str) -> bytes:
         def _get() -> bytes:

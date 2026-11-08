@@ -76,7 +76,7 @@ class SnapshotAssembler:
                 },
             )
             return False
-        await self.objects.put(tenant, content_hash, data)
+        etag = await self.objects.put(tenant, content_hash, data)
         await self.repository.put_object(
             ObjectRecord(
                 tenant=tenant,
@@ -84,6 +84,7 @@ class SnapshotAssembler:
                 size_bytes=len(data),
                 channel=SNAPSHOT_CHANNEL,
                 state=OBJECT_VERIFIED,
+                etag=etag,
             )
         )
         return True

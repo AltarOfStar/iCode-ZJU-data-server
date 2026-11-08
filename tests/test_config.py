@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from icode_data_server.config import Settings
 from icode_data_server.storage import build_object_store, build_repository
-from icode_data_server.storage.objects import LocalObjectStore, object_key
+from icode_data_server.storage.objects import (
+    LocalObjectStore,
+    bare_etag,
+    content_etag,
+    object_key,
+)
 from icode_data_server.storage.repository import MemoryRepository
 
 
@@ -76,8 +82,17 @@ def test_object_key_layout() -> None:
 async def test_local_object_store_round_trip(tmp_path: Path) -> None:
     store = LocalObjectStore(tmp_path)
     await store.start()
-    await store.put("acme", "a" * 64, b"payload")
+    etag = await store.put("acme", "a" * 64, b"payload")
     assert await store.get("acme", "a" * 64) == b"payload"
+    # 登记锚点用单段上传的 ETag：本地实现与 OBS 一样给出内容摘要。
+    assert etag == content_etag(b"payload")
+    assert etag == hashlib.md5(b"payload", usedforsecurity=False).hexdigest()
     assert await store.exists("acme", "a" * 64)
     assert not await store.exists("other", "a" * 64)
-    assert (tmp_path / "t" / "acme" / "o" / "aa" / ("a" * 64)).is_file()
+
+
+def test_provider_etags_lose_their_quotes() -> None:
+    assert bare_etag('"abc123"') == "abc123"
+    assert bare_etag("  abc123  ") == "abc123"
+    assert bare_etag('""') is None
+    assert bare_etag(None) is None
