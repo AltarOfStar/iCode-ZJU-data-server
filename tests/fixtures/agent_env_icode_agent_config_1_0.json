@@ -1,0 +1,63 @@
+{
+  "appVersion": "0.34.0",
+  "hooks": {
+    "count": 2,
+    "events": [
+      "before_tool_call",
+      "user_prompt_submit"
+    ]
+  },
+  "mcp": {
+    "servers": [
+      {
+        "connectionDigest": "0fe63915748f2f3bb202fbaa818538fcf9f5acc6ba93f6b507d412e9a93c7fce",
+        "name": "files",
+        "transport": "stdio"
+      },
+      {
+        "connectionDigest": "55d6d989c2c0be3ae87d1522b4f379bbd10451db32a3f61a727476855bb8cc18",
+        "name": "remote",
+        "transport": "http"
+      }
+    ]
+  },
+  "model": {
+    "modelId": "gpt-4o",
+    "params": {
+      "api_key": "<redacted>",
+      "max_output_tokens": 8192,
+      "model": "gpt-4o"
+    },
+    "profileId": "m1",
+    "provider": "openai"
+  },
+  "platform": "windows-amd64",
+  "profile": {
+    "name": "Wty",
+    "yaml": "api_key: <redacted>\nmax_tokens: 4096\nmodel: m1\nname: Wty\ntools:\n  mcp:\n  - args: <redacted>\n    command: <redacted>\n    env: <redacted>\n    name: files\n    transport: stdio\n  - headers: <redacted>\n    name: remote\n    transport: http\n    url: <redacted>\n"
+  },
+  "redacted": [
+    "api_key",
+    "args",
+    "command",
+    "env",
+    "headers",
+    "url"
+  ],
+  "schema": "agent-config/1.0",
+  "sections": {
+    "hooks": "captured",
+    "mcp": "captured",
+    "model": "captured",
+    "profile": "captured",
+    "skills": "captured"
+  },
+  "skills": [
+    {
+      "digest": "d6234b2119f24784d0ad544f43090671664989dba402e3b9732848849ce791cf",
+      "name": "demo",
+      "source": "config"
+    }
+  ],
+  "truncated": false
+}
