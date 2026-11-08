@@ -679,7 +679,7 @@ class BatchProcessor:
                 RejectionCode.PAYLOAD_SHA_MISMATCH,
                 "assembled bytes do not match the target sha256",
             )
-        await self.objects.put(context.tenant, sha256, data)
+        etag = await self.objects.put(context.tenant, sha256, data)
         await self.repository.put_object(
             ObjectRecord(
                 tenant=context.tenant,
@@ -687,6 +687,7 @@ class BatchProcessor:
                 size_bytes=len(data),
                 channel=channel,
                 state=OBJECT_VERIFIED,
+                etag=etag,
             )
         )
         return Outcome.committed()
@@ -785,6 +786,7 @@ class BatchProcessor:
                 remote_kind=remote_kind(manifest),
                 body_sha256=body_sha,
                 body_size_bytes=len(container),
+                body_etag=etag,
                 head_sha=head["head_sha"],
                 head_tree_sha=head["head_tree_sha"],
                 branch=head["branch"],

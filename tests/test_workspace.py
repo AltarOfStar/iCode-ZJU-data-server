@@ -120,6 +120,23 @@ async def test_workspace_manifest_is_deferred_until_files_arrive(client) -> None
     assert len(rows) == 1
 
 
+async def test_stored_workspace_objects_record_the_store_etag(client) -> None:
+    """`_store_assembled` 与 manifest 容器都把 OBS 的 ETag 写进锚点列。"""
+    payload, contents = _manifest()
+    await client.post_batch(batch(*workspace_file_frames(contents)))
+    (file_sha, _body), *_rest = contents
+    stored_file = await client.repository.get_object("dev", file_sha)
+    assert stored_file is not None and stored_file.etag
+
+    await client.post_batch(
+        unit("workspace.manifest", f"ws:{sha(payload)}", payload, session_id=SESSION)
+    )
+    (row,) = await client.repository.list_workspace_states("dev", SESSION)
+    stored_body = await client.repository.get_object("dev", row.body_sha256)
+    assert stored_body is not None and stored_body.etag
+    assert row.body_etag == stored_body.etag
+
+
 async def test_workspace_ignored_entries_are_paths_only(client) -> None:
     payload, contents = _manifest(ignored=["node_modules/", "dist/"])
     await client.post_batch(batch(*workspace_file_frames(contents)))
