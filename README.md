@@ -28,7 +28,8 @@ src/icode_data_server/
     locks.py        # 按键串行化
   storage/
     models.py       # 与 teams schema v10 在范围内表的行模型
-    objects.py      # ObjectStore 协议 + LocalObjectStore / S3ObjectStore
+    objects.py      # ObjectStore 协议 + LocalObjectStore / S3ObjectStore（OBS 兼容）
+    credentials.py  # 华为云 ECS 委托临时凭证（取 + 缓存 + 过期前刷新）
     repository.py   # Repository 协议 + MemoryRepository
     postgres.py     # PostgresRepository（asyncpg）
     schema.sql      # DDL（teams v10 在范围内表 + 本服务扩列）
@@ -66,7 +67,10 @@ uv run ruff check . && uv run ruff format --check .
 | `ICODE_DS_POSTGRES_AUTO_MIGRATE` | `1` | 启动时幂等应用 `storage/schema.sql`（生产建议关闭，改由部署期执行） |
 | `ICODE_DS_OBJECT_ROOT` | `data/objects` | 本地对象存储根目录 |
 | `ICODE_DS_S3_BUCKET` / `ICODE_DS_S3_ENDPOINT_URL` / `ICODE_DS_S3_REGION` | — | 对接 OBS 时填 `endpoint_url` |
-| `ICODE_DS_S3_ACCESS_KEY_ID` / `ICODE_DS_S3_SECRET_ACCESS_KEY` / `ICODE_DS_S3_PREFIX` | — | 凭据与键前缀 |
+| `ICODE_DS_S3_ACCESS_KEY_ID` / `ICODE_DS_S3_SECRET_ACCESS_KEY` / `ICODE_DS_S3_PREFIX` | — | 凭据与键前缀（对接 OBS 时前缀必须落在被授权范围内，如 `test/plugins/`） |
+| `ICODE_DS_S3_SESSION_TOKEN` | — | 临时凭证的 security token；用静态 AK/SK 时留空 |
+| `ICODE_DS_S3_CREDENTIAL_SOURCE` | `static` | `static` \| `ecs-metadata`：后者从华为云 ECS 元数据取委托临时凭证并自动刷新 |
+| `ICODE_DS_S3_METADATA_URL` | `http://169.254.169.254/openstack/latest/securitykey` | 委托凭证来源地址 |
 | `ICODE_DS_TOKENS` | `{"dev-token":{"tenant":"dev","user_id":"dev-user"}}` | token → `(tenant, user_id)` |
 | `ICODE_DS_AUTH_DISABLED` | `0` | 仅本地开发：缺 token 时按 `default/anonymous` |
 | `ICODE_DS_HOST` / `ICODE_DS_PORT` | `127.0.0.1` / `8080` | 监听地址 |

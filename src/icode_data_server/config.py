@@ -12,6 +12,9 @@ GIB = 1024 * MIB
 
 DEFAULT_DEV_TOKEN = "dev-token"
 
+# 华为云 ECS 元数据服务：带 ECS 委托的实例从这里取临时 AK/SK（见 storage/credentials.py）。
+S3_METADATA_URL_DEFAULT = "http://169.254.169.254/openstack/latest/securitykey"
+
 
 @dataclass(frozen=True, slots=True)
 class Principal:
@@ -92,6 +95,9 @@ class Settings:
     s3_region: str = ""
     s3_access_key_id: str = ""
     s3_secret_access_key: str = ""
+    s3_session_token: str = ""
+    s3_credential_source: str = "static"  # static | ecs-metadata
+    s3_metadata_url: str = S3_METADATA_URL_DEFAULT
     s3_prefix: str = ""
 
     # 限额（server-acceptance §2.1）
@@ -154,6 +160,11 @@ class Settings:
             s3_region=_str("ICODE_DS_S3_REGION", d.s3_region),
             s3_access_key_id=_str("ICODE_DS_S3_ACCESS_KEY_ID", d.s3_access_key_id),
             s3_secret_access_key=_str("ICODE_DS_S3_SECRET_ACCESS_KEY", d.s3_secret_access_key),
+            s3_session_token=_str("ICODE_DS_S3_SESSION_TOKEN", d.s3_session_token),
+            s3_credential_source=_str(
+                "ICODE_DS_S3_CREDENTIAL_SOURCE", d.s3_credential_source
+            ).lower(),
+            s3_metadata_url=_str("ICODE_DS_S3_METADATA_URL", d.s3_metadata_url),
             s3_prefix=_str("ICODE_DS_S3_PREFIX", d.s3_prefix),
             max_body_bytes=_int("ICODE_DS_MAX_BODY_BYTES", d.max_body_bytes),
             max_expanded_bytes=_int("ICODE_DS_MAX_EXPANDED_BYTES", d.max_expanded_bytes),

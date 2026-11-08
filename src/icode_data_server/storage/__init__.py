@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..config import Settings
+from .credentials import EcsMetadataCredentials
 from .models import (
     OBJECT_MISSING,
     OBJECT_PENDING,
@@ -32,12 +33,22 @@ def build_object_store(settings: Settings) -> ObjectStore:
     if backend == "local":
         return LocalObjectStore(settings.local_object_root)
     if backend == "s3":
+        credentials = None
+        if settings.s3_credential_source == "ecs-metadata":
+            credentials = EcsMetadataCredentials(settings.s3_metadata_url)
+        elif settings.s3_credential_source != "static":
+            raise ValueError(
+                "ICODE_DS_S3_CREDENTIAL_SOURCE must be 'static' or 'ecs-metadata': "
+                f"{settings.s3_credential_source}"
+            )
         return S3ObjectStore(
             bucket=settings.s3_bucket,
             endpoint_url=settings.s3_endpoint_url,
             region=settings.s3_region,
             access_key_id=settings.s3_access_key_id,
             secret_access_key=settings.s3_secret_access_key,
+            session_token=settings.s3_session_token,
+            credentials=credentials,
             prefix=settings.s3_prefix,
         )
     raise ValueError(f"unknown OBJECT_STORE_BACKEND: {backend}")
