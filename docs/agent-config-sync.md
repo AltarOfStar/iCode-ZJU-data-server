@@ -15,6 +15,8 @@
 - **信封随重报收敛**（分类变化不改变载荷，client-design §4.4）：同一 `contentHash` 再次上报时响应仍是 `duplicate`，但服务端把信封里的 `workspaceKind`/`capturedAt` 写到锚点与会话行——不新建对象、不汰换。三条边界：内容必须仍是当前锚点（旧 blob 的重放不改任何事实）；`capturedAt` 不得倒退（乱序重放的旧信封被丢弃）；信封非法时按首次校验的口径忽略刷新。
 - 校验（ingest 面，与 teams `service/ingest.ts` `checkedAgentConfigPut` 同口径）：`contentHash == sha256(payload)`；`workspaceKind` 三值枚举；`capturedAt` 必填且 ISO-8601；`size ≤ 256 KiB`（`ICODE_DS_AGENT_ENV_MAX_BYTES`）。
 - 载荷校验只到形状（JSON 对象 + `schema` 匹配 + `redacted[]` 键名）：`sections`（五键、`captured|absent`）与 `truncated`（布尔）为必填成员，出现未知成员按宽松忽略、缺失按显式失败处理（两处口径取一后写入本表，当前 teams 端为"必填"）。
+- **格式与 teams 生产方一致（2026-11-08 对齐）**：载荷字段形状由 `01 §4.6` 的载荷表定义，两个生产方（teams 插件外置上报、iCode 特设版内置上报）产出的**字段逐项相同**：`mcp.servers[]` 的 `transport`/`connectionDigest` 无该事实时**省略**（不填空串）、`settingsDigest` 无显式 settings 时**省略**、`model.params` 只排除 `name`/`id`、`skills[].source` 取 `config|linked|""`、脱敏集合统一（含 `cookie` 段、显式清单与后缀变体、按分段的连接键、`chat_options` 的 JSON 字符串形态）。本服务的载荷形状校验因此对两个生产方同时成立；它**比 teams ingest 更严格**（teams 端不解析载荷、只校验引用与信封），这一差异只影响"畸形载荷何时被拒"，不改变合法载荷的字节或字段，故不构成跨端格式差异。
+- **排序语义的一处已知差异（未对齐，待评估）**：teams 端的收据键标识**一次观察**（`agent-config:<session>:<capturedAt>`，01 §4.6），因此"配置 A→B→A"的第三个单元必定落库、锚点回到 A；本服务的单元键是内容派生的 `sha256(agent.env|session|scope|payload_sha256)`，A→B→A 的第三个单元与最初的 A **同键**，`_refresh_agent_env_envelope` 只在"内容仍是当前锚点"时生效，于是返回 `duplicate` 且锚点停在中转版本 B。修复需要让 `unit_id` 带上采集时刻（客户端 `scope_agent_env` 与服务端 `unit_id_for` 同步改），属传输层变更，须单独立项并同步本表与客户端 §4；在此之前，本服务对"改回旧配置"的会话保留旧锚点——**存证不丢（旧 blob 仍在 OBS），只是行上锚点不是最新观察**。
 
 ## 2. 本仓库与规范的差异清单（同步项）
 
@@ -28,6 +30,7 @@
 | 4 | `ingest/workspace.py`、`processor.py`、`storage/postgres.py`、`storage/repository.py` | 忽略清单三列已**首采冻结**（只在 insert 写入，upsert 的 update 集合不含它们，内存实现同步）；单条 `path ≤ 512` 字符超限按 `schema_invalid`（400）拒绝 | 同目标 |
 | 5 | `ingest/agent_config.py` | 已增加 `sections`（五键、`captured|absent`）与 `truncated`（布尔）必填校验；`capturedAt` 在信封侧校验（必填 RFC3339）；`workspaceKind` 三值枚举在信封侧校验 | 同目标 |
 | 6 | `ingest/processor.py::_refresh_agent_env_envelope`、`storage/*::get_agent_config_anchor_state` | 同 `contentHash` 重报（分类变化、载荷不变）不再被当成无副作用重放：`duplicate` 响应之外把信封的 `workspaceKind`/`capturedAt` 覆写到锚点与会话行，仅当内容仍是当前锚点且 `capturedAt` 不倒退（client-design §4.4 的落地侧；对应 teams 端 `agent_config.put` 的"以最新一次成功为准"） | 同目标 |
+| 7 | 载荷形状（`ingest/agent_config.py`） | 与 2026-11-08 的 teams 生产方对齐：`sections`/`truncated`/`redacted[]` 必填已就绪；`mcp.servers[]` 的派生字段可缺、`settingsDigest` 可缺——形状校验不涉这两处内部结构，两生产方载荷都被接受 | 同目标 |
 
 ## 3. 存储与消费口径（不变项）
 

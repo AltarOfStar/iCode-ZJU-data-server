@@ -426,6 +426,11 @@ async def test_the_icode_client_payload_is_accepted(client) -> None:
 
     样本由 `service/reporting/agent_config.py` 对一份含 profile/model/技能/MCP
     (stdio+http)/hooks 的布局生成；载荷形状变了就重新产出这一份（别手改）。
+
+    2026-11-08 的格式对齐只改了一个字段：该布局没有显式 hook `settings`，客户端
+    因此**不再输出 `settingsDigest`**（旧样本里是 `sha256({})`），已按生产者口径重出一份；
+    其余字段（含 `mcp.servers[]` 的 `transport`/`connectionDigest`）逐字未动。下次形状
+    再变时仍须从真实配置根重产，不要手改。
     """
     payload = (
         Path(__file__).parent / "fixtures" / "agent_env_icode_agent_config_1_0.json"
