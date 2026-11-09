@@ -13,7 +13,7 @@ from icode_data_server.ingest.derive import (
     split_payload,
 )
 
-from .helpers import SESSION, trajectory_payload, unit
+from .helpers import SESSION, TENANT, trajectory_payload, unit
 
 
 def _lines(specs: list[tuple[int, str, dict, str]]) -> list:
@@ -248,6 +248,22 @@ async def test_out_of_order_frames_converge_to_same_windows(
         (row.first_event_sequence, row.last_event_sequence, row.payload_sha256) for row in batches_b
     ]
     assert len(batches_a) == 2
+
+
+async def test_a_committed_window_records_the_object_etag(custom_client, event_line) -> None:
+    """`object_registry.etag` and `event_batches.payload_etag` carry the store's ETag."""
+    api = await custom_client()
+    lines = [event_line(1, "turn.finished", payload={"turn_number": 1})]
+
+    await api.post_batch(
+        unit("trajectory.lines", "lines:1-1", trajectory_payload(lines), session_id=SESSION)
+    )
+
+    (batch,) = api.repository.batches.values()
+    stored = await api.repository.get_object(TENANT, batch.payload_sha256)
+    assert stored is not None
+    assert stored.etag
+    assert batch.payload_etag == stored.etag
 
 
 async def test_same_sequence_different_content_conflicts(client, event_line) -> None:

@@ -155,7 +155,7 @@ class TrajectoryStore:
         state.gaps = derivation.gaps
 
     async def _commit_window(self, tenant: str, session_id: str, window: DerivedWindow) -> None:
-        await self.objects.put(tenant, window.payload_sha256, window.payload)
+        etag = await self.objects.put(tenant, window.payload_sha256, window.payload)
         await self.repository.put_object(
             ObjectRecord(
                 tenant=tenant,
@@ -163,6 +163,7 @@ class TrajectoryStore:
                 size_bytes=len(window.payload),
                 channel=WINDOW_CHANNEL,
                 state="verified",
+                etag=etag,
             )
         )
         await self.repository.put_batch(
@@ -180,6 +181,7 @@ class TrajectoryStore:
                 completeness_state=window.completeness,
                 payload_sha256=window.payload_sha256,
                 payload_size=len(window.payload),
+                payload_etag=etag,
             )
         )
         await self.repository.put_events(

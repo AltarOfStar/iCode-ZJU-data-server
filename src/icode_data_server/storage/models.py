@@ -137,6 +137,7 @@ class BatchRecord:
     completeness_state: str
     payload_sha256: str
     payload_size: int
+    payload_etag: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

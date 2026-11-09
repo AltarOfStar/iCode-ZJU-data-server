@@ -414,8 +414,8 @@ class PostgresRepository:
             "insert into event_batches"
             " (tenant, session_id, batch_id, generation, client_sequence, first_event_sequence,"
             "  last_event_sequence, event_count, unparsed_count, gap_count, completeness_state,"
-            "  payload_sha256, payload_size)"
-            " values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)"
+            "  payload_sha256, payload_size, payload_etag)"
+            " values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
             " on conflict (tenant, batch_id) do nothing",
             record.tenant,
             record.session_id,
@@ -430,6 +430,7 @@ class PostgresRepository:
             record.completeness_state,
             record.payload_sha256,
             record.payload_size,
+            record.payload_etag,
         )
 
     async def put_events(self, records: Sequence[EventRecord]) -> None:

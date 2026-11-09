@@ -441,7 +441,9 @@ class BatchProcessor:
         """未知 kind / 更高帧版本：原样写隔离对象 + 收据 `unsupported`，不解析内容（§3.1-4）。"""
         async with self.repository.transaction():
             if frame.payload:
-                await self.objects.put(principal.tenant, frame.header.payload_sha256, frame.payload)
+                etag = await self.objects.put(
+                    principal.tenant, frame.header.payload_sha256, frame.payload
+                )
                 await self.repository.put_object(
                     ObjectRecord(
                         tenant=principal.tenant,
@@ -449,6 +451,7 @@ class BatchProcessor:
                         size_bytes=len(frame.payload),
                         channel=QUARANTINE_CHANNEL,
                         state=OBJECT_VERIFIED,
+                        etag=etag,
                     )
                 )
             await self.repository.put_receipt(
@@ -528,7 +531,9 @@ class BatchProcessor:
             )
         content_hash = match.group("sha")
         # 分块本身就是内容寻址对象：落 OBS + 登记（幂等，重放即重新物化）。
-        await self.objects.put(context.tenant, context.frame.header.payload_sha256, context.payload)
+        etag = await self.objects.put(
+            context.tenant, context.frame.header.payload_sha256, context.payload
+        )
         await self.repository.put_object(
             ObjectRecord(
                 tenant=context.tenant,
@@ -536,6 +541,7 @@ class BatchProcessor:
                 size_bytes=len(context.payload),
                 channel=SNAPSHOT_CHUNK_CHANNEL,
                 state=OBJECT_VERIFIED,
+                etag=etag,
             )
         )
         # 该快照的清单已到（登记为缺块行）→ 缺口一补齐就立刻拼装整份快照。
@@ -673,7 +679,7 @@ class BatchProcessor:
                 RejectionCode.PAYLOAD_SHA_MISMATCH,
                 "assembled bytes do not match the target sha256",
             )
-        await self.objects.put(context.tenant, sha256, data)
+        etag = await self.objects.put(context.tenant, sha256, data)
         await self.repository.put_object(
             ObjectRecord(
                 tenant=context.tenant,
@@ -681,6 +687,7 @@ class BatchProcessor:
                 size_bytes=len(data),
                 channel=channel,
                 state=OBJECT_VERIFIED,
+                etag=etag,
             )
         )
         return Outcome.committed()
@@ -753,7 +760,7 @@ class BatchProcessor:
             return Outcome.rejected(RejectionCode.MISSING_REFERENCE, str(exc))
 
         body_sha = container_sha256(container)
-        await self.objects.put(context.tenant, body_sha, container)
+        etag = await self.objects.put(context.tenant, body_sha, container)
         await self.repository.put_object(
             ObjectRecord(
                 tenant=context.tenant,
@@ -761,6 +768,7 @@ class BatchProcessor:
                 size_bytes=len(container),
                 channel="workspace-state",
                 state=OBJECT_VERIFIED,
+                etag=etag,
             )
         )
         counts = summary_counts(manifest)
@@ -778,6 +786,7 @@ class BatchProcessor:
                 remote_kind=remote_kind(manifest),
                 body_sha256=body_sha,
                 body_size_bytes=len(container),
+                body_etag=etag,
                 head_sha=head["head_sha"],
                 head_tree_sha=head["head_tree_sha"],
                 branch=head["branch"],
@@ -902,7 +911,7 @@ class BatchProcessor:
             parse_agent_config(context.payload, max_bytes=self.settings.agent_env_max_bytes)
         except AgentConfigError as exc:
             return Outcome.rejected(RejectionCode.SCHEMA_INVALID, str(exc))
-        await self.objects.put(context.tenant, sha256, context.payload)
+        etag = await self.objects.put(context.tenant, sha256, context.payload)
         await self.repository.put_object(
             ObjectRecord(
                 tenant=context.tenant,
@@ -910,6 +919,7 @@ class BatchProcessor:
                 size_bytes=len(context.payload),
                 channel="agent-config",
                 state=OBJECT_VERIFIED,
+                etag=etag,
             )
         )
         # 覆写汰换（agent-config-sync §1）：同会话换新配置时，旧引用对象置

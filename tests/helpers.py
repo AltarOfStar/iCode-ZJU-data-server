@@ -9,6 +9,7 @@ from typing import Any
 from icode_data_server.frames import encode_frame, payload_sha256, unit_id_for
 
 SESSION = "11111111-1111-4111-8111-111111111111"
+TENANT = "dev"
 DEV_TOKEN = "dev-token"
 
 
